@@ -40,6 +40,16 @@ USE_WEBHOOK = os.getenv("USE_WEBHOOK", "").strip() in ("1", "true", "True", "yes
 MAX_MB = int(os.getenv("MAX_MB", "50"))
 MAX_BYTES = MAX_MB * 1024 * 1024
 
+# -------------------- COOKIES (YouTube auth) --------------------
+# Render Secret Files: filename "cookies.txt" -> available at /etc/secrets/cookies.txt
+COOKIES_PATH = os.getenv("COOKIES_PATH", "/etc/secrets/cookies.txt").strip()
+USE_COOKIES = os.path.exists(COOKIES_PATH) and os.path.getsize(COOKIES_PATH) > 0
+
+# A reasonable browser-like User-Agent reduces "confirm you're not a bot" challenges
+USER_AGENT = os.getenv(
+    "USER_AGENT",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+).strip()
 # -------------------- MEMORY (pending choices) --------------------
 @dataclass
 class PendingChoice:
@@ -369,6 +379,7 @@ async def _post_init_set_webhook(app: Application):
         log.exception("Webhook set error")
 
 def main():
+    log.info("Cookies file: %s (exists=%s, size=%s)", COOKIES_PATH, os.path.exists(COOKIES_PATH), os.path.getsize(COOKIES_PATH) if os.path.exists(COOKIES_PATH) else 0)
     app = build_app()
 
     # Agar WEBHOOK_URL bor bo‘lsa (yoki USE_WEBHOOK=1) webhook ishlatamiz
