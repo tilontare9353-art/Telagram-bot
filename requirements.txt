@@ -1,3 +1,2 @@
-python-telegram-bot>=20.7
-asyncpg
-Flask>=3,<4
+yt-dlp
+python-telegram-bot==21.6
