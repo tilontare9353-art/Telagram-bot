@@ -396,4 +396,9 @@ def build_app() -> Application:
 
     return app
 
-
+if __name__ == "__main__":
+    app = build_app()
+    app.run_polling(
+        close_loop=False,
+        allowed_updates=Update.ALL_TYPES,
+    )
