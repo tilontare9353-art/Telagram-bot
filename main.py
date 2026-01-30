@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Universal Downloader Bot (Render-ready, python-telegram-bot v20+)
+Universal Downloader Bot (Railway-ready, python-telegram-bot v20+)
 
 Asosiy imkoniyatlar:
 - YouTube: faqat MAVJUD formatlar tugmalari chiqadi (144p/360p/720p... mavjud bo'lsa bor).
@@ -15,16 +15,16 @@ Til:
 - O‘zbekcha salomlashish matni o'zgarmaydi.
 - Ruscha tanlanganda barcha asosiy yozuvlar ruscha chiqadi.
 
-Render uchun:
-- Tavsiya: webhook rejimi (RUN_MODE=webhook).
+Railway/Cloud учун:
+- Tavsiya: polling режими (RUN_MODE=polling). Webhook ҳам мумкин (RUN_MODE=webhook).
 - ENV:
   BOT_TOKEN          (majburiy)
   ADMIN_IDS          (ixtiyoriy) "123,456"
-  DATABASE_URL       (tavsiya) Render Postgres connection string
-  WEBHOOK_URL        (webhook rejimi uchun) masalan: https://your-service.onrender.com
+  DATABASE_URL       (tavsiya) Postgres connection string (Railway Postgres ёки бошқа)
+  WEBHOOK_URL        (webhook rejimi uchun) масалан: https://<your-domain>
   WEBHOOK_PATH       (ixtiyoriy) default: webhook
-  PORT               (Render beradi)
-  DATA_DIR           (fallback json storage uchun; Renderda tavsiya emas)
+  PORT               (webhook режимда платформа беради: Railway ва бошқалар)
+  DATA_DIR           (fallback json storage uchun; cloud серверда тавсия этилмайди)
 
 Eslatma:
 - MP3 konvertatsiya uchun ffmpeg tavsiya qilinadi. Bo'lmasa m4a/webm audio yuboriladi.
@@ -34,7 +34,7 @@ try:
     from dotenv import load_dotenv
     load_dotenv()
 except Exception:
-    # python-dotenv is optional on Render
+    # python-dotenv optional (local test учун)
     pass
 
 import os
@@ -88,7 +88,7 @@ if _admin_raw:
 DATA_DIR = Path((os.getenv("DATA_DIR") or ".")).resolve()
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-# Fallback json storage (Renderda tavsiya emas)
+# Fallback json storage (cloud серверда тавсия этилмайди)
 USERS_FILE = DATA_DIR / "users.json"
 PREFS_FILE = DATA_DIR / "prefs.json"
 
@@ -100,7 +100,25 @@ CALLBACK_CACHE: Dict[str, Dict[str, Any]] = {}
 CALLBACK_CACHE_MAX = 3000
 
 RUN_MODE = (os.getenv("RUN_MODE") or "").strip().lower()  # "webhook" or "polling"
-WEBHOOK_URL_BASE = (os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").strip()
+def _guess_public_base_url() -> str:
+    """Webhook учун public base URL ни топиш (RUN_MODE=webhook бўлса)."""
+    v = (os.getenv("WEBHOOK_URL") or "").strip()
+    if v:
+        return v.rstrip("/")
+    # Railway: best-effort (ҳамма аккаунтларда бўлмаслиги мумкин)
+    dom = (os.getenv("RAILWAY_PUBLIC_DOMAIN") or os.getenv("RAILWAY_STATIC_DOMAIN") or "").strip()
+    if dom:
+        return f"https://{dom}".rstrip("/")
+    v = (os.getenv("RAILWAY_PUBLIC_URL") or "").strip()
+    if v:
+        return v.rstrip("/")
+    # Render (ixtiyoriy fallback, агар керак бўлса)
+    v = (os.getenv("RENDER_EXTERNAL_URL") or "").strip()
+    if v:
+        return v.rstrip("/")
+    return ""
+
+WEBHOOK_URL_BASE = _guess_public_base_url()
 WEBHOOK_PATH = (os.getenv("WEBHOOK_PATH") or "webhook").strip().lstrip("/")
 PORT = int(os.getenv("PORT") or "8080")
 
@@ -114,33 +132,33 @@ LANG_UZ = "uz"
 LANG_RU = "ru"
 
 START_TEXT_UZ = (
-    "👋🏻 Salom\n"
-    "Telegramdagi YouTube’dan, Tiktokdan, Instagram va Focebookdan video, audiolarni yuklab olish uchun eng tezkor "
+    "👋🏻 <b>Salom</b>\n"
+    "Telegramdagi <b>YouTube</b>’dan, <b>Tiktokdan</b>, <b>Instagram</b> va <b>Focebook</b>dan video, audiolarni yuklab olish uchun eng tezkor "
     f"{BOT_USERNAME_TAG} ga xush kelibsiz.\n\n"
-    "✅ Botning imkoniyatlari:\n"
+    "✅ <b>Botning imkoniyatlari:</b>\n"
     "✨ Youtubedan Video sifatini tanlash imkoniyati;\n"
     "📁 Video va audioni saqlab olish(cheksiz);\n"
     "💫 Yuklab olingan faylni do'stlarga ulashish;\n"
     "ℹ️ Botni guruxingizda admin qiling va guruhga yuborilgan havolalarni video ko’rinishida guruxingizga shu havola ostiga tashlab beradi.\n"
-    "ℹ️ Botni guruxingizda reklama tarqatmaydi.\n"
+    "ℹ️ <b>Botni guruxingizda reklama tarqatmaydi</b>.\n"
     "ℹ️ Biror bir xatolikga duch kelsangiz bizni botlar kanaliga o’ting va u yerdagi adminlarga habar bering.\n"
     "Bizning foydali botlar kanali 👉 https://t.me/+skp5TgimYIJjYzIy\n\n"
-    "🔗 BOSHLASH UCHUN YOUTUBEDAGI VIDEO HAVOLASINI YUBORING…⤵️"
+    "🔗 <b>BOSHLASH UCHUN VIDEO HAVOLASINI YUBORING</b>…⤵️"
 )
 
 START_TEXT_RU = (
-    "👋🏻 Привет\n"
-    "Добро пожаловать в самый быстрый бот, чтобы скачивать видео и аудио из YouTube, TikTok, Instagram и Facebook: "
+    "👋🏻 <b>Привет</b>\n"
+    "Добро пожаловать в самый быстрый бот, чтобы скачивать видео и аудио из <b>YouTube</b>, <b>TikTok</b>, <b>Instagram</b> и <b>Facebook</b>: "
     f"{BOT_USERNAME_TAG}\n\n"
-    "✅ Возможности бота:\n"
+    "✅ <b>Возможности бота:</b>\n"
     "✨ Выбор качества видео YouTube;\n"
     "📁 Скачивание видео и аудио (без ограничений);\n"
     "💫 Возможность делиться скачанным файлом с друзьями;\n"
     "ℹ️ Сделайте бота администратором в группе — и он будет отправлять скачанное видео ответом под сообщением со ссылкой.\n"
-    "ℹ️ Бот не распространяет рекламу в вашей группе.\n"
+    "ℹ️ <b>Бот не распространяет рекламу в вашей группе</b>.\n"
     "ℹ️ Если столкнётесь с ошибкой — перейдите в наш канал ботов и напишите администраторам.\n"
     "Наш полезный канал ботов 👉 https://t.me/+skp5TgimYIJjYzIy\n\n"
-    "🔗 ДЛЯ НАЧАЛА ОТПРАВЬТЕ ССЫЛКУ НА ВИДЕО С YOUTUBE…⤵️"
+    "🔗 <b>ДЛЯ НАЧАЛА ОТПРАВЬТЕ ССЫЛКУ НА ВИДЕО</b>…⤵️"
 )
 
 TEXT = {
@@ -183,13 +201,13 @@ TEXT = {
         LANG_RU: "❌ Слишком длинное имя файла (ограничение сервера). Выберите другой вариант или отправьте ссылку заново.",
     },
     "yt_need_cookies": {
-        LANG_UZ: "❌ YouTube «men robot emasman» tekshiruvini so‘radi. Render’da YouTube ishlashi uchun браузердан экспорт қилинган Netscape formatdagi cookies.txt kerak.",
-        LANG_RU: "❌ YouTube требует подтверждение «я не бот». На Render для YouTube нужен cookies.txt, экспортированный из браузера (формат Netscape).",
+        LANG_UZ: "❌ YouTube «men robot emasman» tekshiruvini so‘radi. YouTube ишлаши учун (cloud серверда) браузердан экспорт қилинган Netscape formatdagi cookies.txt kerak.",
+        LANG_RU: "❌ YouTube требует подтверждение «я не бот». Cloud серверда YouTube учун ҳам керак:  cookies.txt, экспортированный из браузера (формат Netscape).",
     },
     
     "yt_botcheck_even_with_cookies": {
-        LANG_UZ: "❌ YouTube «men robot emasman» tekshiruvini so‘radi. Cookies topilgan bo‘lsa ham Render/IP blok sababli baribir captcha chiqishi mumkin. Cookies.txt ni yangilang (login bo‘lgan brauzerdan), yoki VPS/Proxy (rezident IP) ishlating.",
-        LANG_RU: "❌ YouTube просит подтверждение «я не бот». Даже с cookies на Render (datacenter IP) капча может появляться. Обновите cookies.txt (из залогиненного браузера) или используйте VPS/Proxy (резидентный IP).",
+        LANG_UZ: "❌ YouTube «men robot emasman» tekshiruvini so‘radi. Cookies топилган бўлса ҳам cloud/IP блок сабабли baribir captcha chiqishi mumkin. Cookies.txt ni yangilang (login bo‘lgan brauzerdan), yoki VPS/Proxy (rezident IP) ishlating.",
+        LANG_RU: "❌ YouTube просит подтверждение «я не бот». Ҳатто cookies билан ҳам cloud (datacenter IP) капча может появляться. Обновите cookies.txt (из залогиненного браузера) или используйте VPS/Proxy (резидентный IP).",
     },
 "err_generic": {LANG_UZ: "❌ Xatolik: {err}", LANG_RU: "❌ Ошибка: {err}"},
     "not_admin": {LANG_UZ: "❌ Siz admin emassiz.", LANG_RU: "❌ Вы не админ."},
@@ -293,7 +311,7 @@ class UserStore:
     async def init(self) -> None:
         if not DATABASE_URL or asyncpg is None:
             if not DATABASE_URL:
-                log.warning("DATABASE_URL topilmadi — fallback: users.json ishlatiladi (Renderda tavsiya emas).")
+                log.warning("DATABASE_URL topilmadi — fallback: users.json ishlatiladi (cloud серверда тавсия этилмайди).")
             else:
                 log.warning("asyncpg import bo'lmadi — fallback: users.json ishlatiladi.")
             return
@@ -734,6 +752,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await update.message.reply_text(
         start_text_by_lang(lang),
+        parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
         reply_markup=InlineKeyboardMarkup(kb),
     )
@@ -770,6 +789,7 @@ async def on_lang_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     try:
         await q.edit_message_text(
             start_text_by_lang(lang),
+            parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
             reply_markup=markup,
         )
@@ -779,6 +799,7 @@ async def on_lang_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await context.bot.send_message(
                 chat_id=q.message.chat_id if q.message else update.effective_chat.id,
                 text=start_text_by_lang(lang),
+                parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
                 reply_markup=markup,
             )
