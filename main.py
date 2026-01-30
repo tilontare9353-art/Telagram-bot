@@ -40,6 +40,7 @@ import asyncio
 import logging
 import tempfile
 import secrets
+import base64
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
 
@@ -418,10 +419,55 @@ def _cache_get(token: str) -> Optional[Dict[str, Any]]:
     return CALLBACK_CACHE.get(token)
 
 
+
+
+# ---------------------------- yt-dlp cookies helpers ----------------------------
+
+_COOKIEFILE_PATH: Optional[str] = None
+
+def _ensure_cookiefile() -> Optional[str]:
+    """Return path to a cookies.txt file if provided via env.
+    - YT_COOKIES_FILE: absolute path (local use)
+    - YT_COOKIES_B64: base64 of cookies.txt (Render Secrets)
+    """
+    global _COOKIEFILE_PATH
+    if _COOKIEFILE_PATH is not None:
+        return _COOKIEFILE_PATH or None
+
+    pth = (os.getenv("YT_COOKIES_FILE") or "").strip()
+    if pth and os.path.exists(pth):
+        _COOKIEFILE_PATH = pth
+        return pth
+
+    b64 = (os.getenv("YT_COOKIES_B64") or "").strip()
+    if b64:
+        try:
+            data = base64.b64decode(b64.encode("utf-8"))
+            tmp = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
+            with open(tmp, "wb") as f:
+                f.write(data)
+            _COOKIEFILE_PATH = tmp
+            return tmp
+        except Exception as e:
+            logging.warning("YT_COOKIES_B64 decode xatosi: %s", e)
+
+    _COOKIEFILE_PATH = ""
+    return None
+
+
+
+def _friendly_ydl_error(err: Exception, lang: str) -> str:
+    s = str(err) if err is not None else "Unknown error"
+    if "File name too long" in s or "Errno 36" in s:
+        return _t("err_filename_too_long", lang)
+    if ("Sign in to confirm" in s) and ("not a bot" in s):
+        return _t("yt_need_cookies", lang)
+    return s
+
 # ---------------------------- yt-dlp helpers ----------------------------
 
 def build_ydl_base(outtmpl: str) -> Dict[str, Any]:
-    return {
+    opts = {
         "outtmpl": outtmpl,
         "noplaylist": True,
         "quiet": True,
@@ -437,6 +483,25 @@ def build_ydl_base(outtmpl: str) -> Dict[str, Any]:
         "buffersize": 1024 * 1024,
         "http_chunk_size": 10 * 1024 * 1024,
     }
+
+
+    # Cookies (YouTube datacenter bloklari uchun foydali)
+    cookiefile = _ensure_cookiefile()
+    if cookiefile:
+        opts["cookiefile"] = cookiefile
+
+    # YouTube extractor: ba'zan android client yumshoqroq ishlaydi
+    opts.setdefault("extractor_args", {})
+    opts["extractor_args"].setdefault("youtube", {})
+    opts["extractor_args"]["youtube"].setdefault("player_client", ["android", "web"])
+
+    # User-Agent (ixtiyoriy)
+    ua = (os.getenv("YTDLP_UA") or "").strip()
+    if ua:
+        opts.setdefault("http_headers", {})
+        opts["http_headers"]["User-Agent"] = ua
+
+    return opts
 
 def _extract_info(url: str) -> Dict[str, Any]:
     ydl_opts = build_ydl_base(outtmpl="%(title)s.%(ext)s")
@@ -477,7 +542,7 @@ def _select_youtube_formats(info: Dict[str, Any]) -> List[Dict[str, Any]]:
     return picked
 
 def _download_video(url: str, format_id: Optional[str], workdir: str) -> Path:
-    outtmpl = os.path.join(workdir, "%(title).200s.%(ext)s")
+    outtmpl = os.path.join(workdir, "%(id)s.%(ext)s")
 
     def _run_with_opts(opts: Dict[str, Any]) -> Path:
         with YoutubeDL(opts) as ydl:
@@ -535,7 +600,7 @@ def _download_video(url: str, format_id: Optional[str], workdir: str) -> Path:
         return _run_with_opts(ydl_opts_fallback)
 
 def _download_audio(url: str, workdir: str) -> Path:
-    outtmpl = os.path.join(workdir, "%(title).200s.%(ext)s")
+    outtmpl = os.path.join(workdir, "%(id)s.%(ext)s")
 
     ydl_opts = build_ydl_base(outtmpl=outtmpl)
     ydl_opts["format"] = "bestaudio/best"
