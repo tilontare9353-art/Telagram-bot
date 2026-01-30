@@ -489,18 +489,18 @@ def _ensure_cookiefile() -> Optional[str]:
                 if pad:
                     b64_clean += "=" * pad
                 data = base64.b64decode(b64_clean.encode("utf-8"), validate=False)
-            tmp_path = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
-            with open(tmp_path, "wb") as f:
-                f.write(data)
-            try:
-                os.chmod(tmp_path, 0o600)
-            except Exception:
-                pass
-            _COOKIEFILE_PATH = tmp_path
-            _warn_if_suspicious(_COOKIEFILE_PATH)
-            return _COOKIEFILE_PATH
-        except Exception as e:
-            log.warning("YT_COOKIES_B64 decode xatosi: %s", e)
+                tmp_path = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
+                with open(tmp_path, "wb") as f:
+                    f.write(data)
+                try:
+                    os.chmod(tmp_path, 0o600)
+                except Exception:
+                    pass
+                _COOKIEFILE_PATH = tmp_path
+                _warn_if_suspicious(_COOKIEFILE_PATH)
+                return _COOKIEFILE_PATH
+            except Exception as e:
+                log.warning("YT_COOKIES_B64 decode xatosi: %s", e)
 
     # 2) File path variant (Render Secret Files are read-only)
     # NOTE: Render Secret Files can be available either at /etc/secrets/<filename>
