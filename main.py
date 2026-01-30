@@ -492,12 +492,30 @@ def _ensure_cookiefile() -> Optional[str]:
             log.warning("YT_COOKIES_B64 decode xatosi: %s", e)
 
     # 2) File path variant (Render Secret Files are read-only)
-    src_path = (os.getenv("YT_COOKIES_FILE") or "").strip()
-    if src_path:
-        if not os.path.exists(src_path):
-            log.warning("YT_COOKIES_FILE topildi, lekin fayl yo'q: %s", src_path)
-            return None
+    # NOTE: Render Secret Files can be available either at /etc/secrets/<filename>
+    # or copied into the app root. Some users also set a wrong path by mistake.
+    # We'll try a small set of sensible fallbacks.
+    src_path_env = (os.getenv("YT_COOKIES_FILE") or "").strip()
 
+    candidates: list[str] = []
+    if src_path_env:
+        candidates.append(src_path_env)
+
+    # If env path points to /etc/secrets, also try the same basename in common places
+    basename = os.path.basename(src_path_env) if src_path_env else "cookies.txt"
+
+    # Standard Render mount
+    candidates.append(os.path.join("/etc/secrets", basename))
+
+    # App root / current working dir fallbacks
+    candidates.append(basename)
+    candidates.append(os.path.join(os.getcwd(), basename))
+    candidates.append(os.path.join("/opt/render/project/src", basename))
+
+    # Pick the first existing candidate
+    src_path = next((c for c in candidates if c and os.path.exists(c)), "")
+
+    if src_path:
         tmp_path = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
         try:
             shutil.copyfile(src_path, tmp_path)
@@ -515,6 +533,14 @@ def _ensure_cookiefile() -> Optional[str]:
             _warn_if_suspicious(_COOKIEFILE_PATH)
             return _COOKIEFILE_PATH
 
+    # Nothing found: log minimal debug hints (no sensitive contents)
+    if src_path_env:
+        log.warning("YT_COOKIES_FILE topildi, lekin fayl yo'q: %s", src_path_env)
+    try:
+        if os.path.isdir("/etc/secrets"):
+            log.info("/etc/secrets ro'yxati: %s", ", ".join(sorted(os.listdir("/etc/secrets"))))
+    except Exception:
+        pass
     return None
 
 
