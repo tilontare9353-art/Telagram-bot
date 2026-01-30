@@ -38,6 +38,7 @@ except Exception:
     pass
 
 import os
+import uuid
 import re
 import json
 import asyncio
@@ -185,7 +186,12 @@ TEXT = {
         LANG_UZ: "❌ YouTube «men robot emasman» tekshiruvini so‘radi. Render’da YouTube ishlashi uchun браузердан экспорт қилинган Netscape formatdagi cookies.txt kerak.",
         LANG_RU: "❌ YouTube требует подтверждение «я не бот». На Render для YouTube нужен cookies.txt, экспортированный из браузера (формат Netscape).",
     },
-    "err_generic": {LANG_UZ: "❌ Xatolik: {err}", LANG_RU: "❌ Ошибка: {err}"},
+    
+    "yt_botcheck_even_with_cookies": {
+        LANG_UZ: "❌ YouTube «men robot emasman» tekshiruvini so‘radi. Cookies topilgan bo‘lsa ham Render/IP blok sababli baribir captcha chiqishi mumkin. Cookies.txt ni yangilang (login bo‘lgan brauzerdan), yoki VPS/Proxy (rezident IP) ishlating.",
+        LANG_RU: "❌ YouTube просит подтверждение «я не бот». Даже с cookies на Render (datacenter IP) капча может появляться. Обновите cookies.txt (из залогиненного браузера) или используйте VPS/Proxy (резидентный IP).",
+    },
+"err_generic": {LANG_UZ: "❌ Xatolik: {err}", LANG_RU: "❌ Ошибка: {err}"},
     "not_admin": {LANG_UZ: "❌ Siz admin emassiz.", LANG_RU: "❌ Вы не админ."},
     "usage_broadcast": {
         LANG_UZ: "Ishlatish: /broadcast xabar_matni",
@@ -440,132 +446,95 @@ def _cache_get(token: str) -> Optional[Dict[str, Any]]:
 _COOKIEFILE_PATH: Optional[str] = None
 _COOKIE_LOGGED: bool = False
 
-def _ensure_cookiefile() -> Optional[str]:
-    """Return a **writable** path to cookies.txt if provided via env.
+def _ensure_cookiefile(workdir: Optional[str] = None) -> Optional[str]:
+    """Prepare a **writable** cookies.txt for yt-dlp and return its path.
 
-    Render secret files are mounted under /etc/secrets and are **read-only**.
-    yt-dlp may update cookies on exit, so we copy the secret file to a writable
-    location (e.g. /tmp) and pass that path to yt-dlp.
+    Important: do NOT reuse the same temp cookies path across concurrent requests.
+    yt-dlp may update cookies on exit, and parallel runs can corrupt a shared file.
+    So we create a fresh temp file per call.
 
-    Env options:
+    Sources:
+    - YT_COOKIES_B64: base64 of cookies.txt
     - YT_COOKIES_FILE: path to cookies.txt (e.g. /etc/secrets/cookies.txt)
-    - YT_COOKIES_B64: base64 string of cookies.txt (alternative)
     """
-    global _COOKIEFILE_PATH
-
-    # If already prepared and still exists, reuse (avoid copying every request)
-    if _COOKIEFILE_PATH and os.path.exists(_COOKIEFILE_PATH):
-        return _COOKIEFILE_PATH
+    def _dst_path() -> str:
+        base_dir = workdir if workdir else tempfile.gettempdir()
+        os.makedirs(base_dir, exist_ok=True)
+        return os.path.join(base_dir, f"yt_cookies_{uuid.uuid4().hex}.txt")
 
     def _warn_if_suspicious(path: str) -> None:
-        """Best-effort sanity checks (doesn't print cookie contents)."""
         try:
             sz = os.path.getsize(path)
             if sz <= 0:
                 log.warning("YT cookies file is empty: %s", path)
                 return
-            # Check only the first line for Netscape header
             with open(path, "rb") as f:
                 head = f.read(256)
             head_txt = head.decode("utf-8", errors="ignore").strip()
             if head_txt and ("Netscape" not in head_txt) and ("# HTTP Cookie File" not in head_txt):
-                # Not always required, but usually indicates wrong export format
                 log.warning("YT cookies file may be in a non-Netscape format: %s", path)
         except Exception:
             pass
 
-    # 1) Base64 variant (best for env-only setups)
+    # 1) Base64 variant
     b64 = (os.getenv("YT_COOKIES_B64") or "").strip()
     if b64:
-        # Some users mistakenly paste the *PowerShell command* instead of its output.
-        # If it looks like a command, ignore it and fall back to YT_COOKIES_FILE.
+        # If user pasted the PowerShell command instead of output, ignore.
         if ("[Convert]::ToBase64String" in b64) or ("ReadAllBytes" in b64):
             log.warning("YT_COOKIES_B64 qiymati base64 emas (buyruq matni ko‘rinadi). Uni o‘chirib tashlang yoki haqiqiy base64 natijani kiriting.")
         else:
             try:
-                # Remove whitespace/newlines, then auto-pad to a multiple of 4 (fixes 'Incorrect padding')
-                b64_clean = re.sub(r"\s+", "", b64)
-                pad = (-len(b64_clean)) % 4
+                import base64
+                clean = re.sub(r"\s+", "", b64)
+                # Fix missing padding
+                pad = (-len(clean)) % 4
                 if pad:
-                    b64_clean += "=" * pad
-                data = base64.b64decode(b64_clean.encode("utf-8"), validate=False)
-                tmp_path = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
+                    clean += "=" * pad
+                data = base64.b64decode(clean.encode("ascii"), validate=False)
+                tmp_path = _dst_path()
                 with open(tmp_path, "wb") as f:
                     f.write(data)
-                try:
-                    os.chmod(tmp_path, 0o600)
-                except Exception:
-                    pass
-                _COOKIEFILE_PATH = tmp_path
-                _warn_if_suspicious(_COOKIEFILE_PATH)
-                return _COOKIEFILE_PATH
+                _warn_if_suspicious(tmp_path)
+                log.info("YT cookies (b64) tayyor: %s (exists=%s, size=%s)", tmp_path, os.path.exists(tmp_path), os.path.getsize(tmp_path))
+                return tmp_path
             except Exception as e:
                 log.warning("YT_COOKIES_B64 decode xatosi: %s", e)
 
-    # 2) File path variant (Render Secret Files are read-only)
-    # NOTE: Render Secret Files can be available either at /etc/secrets/<filename>
-    # or copied into the app root. Some users also set a wrong path by mistake.
-    # We'll try a small set of sensible fallbacks.
-    src_path_env = (os.getenv("YT_COOKIES_FILE") or "").strip()
-
+    # 2) File path variant
+    src = (os.getenv("YT_COOKIES_FILE") or "").strip()
     candidates: list[str] = []
-    if src_path_env:
-        candidates.append(src_path_env)
+    if src:
+        candidates.append(src)
+        candidates.append(os.path.join("/etc/secrets", os.path.basename(src)))
+        candidates.append(os.path.basename(src))
+    candidates += ["/etc/secrets/cookies.txt", "/etc/secrets/Cookies.txt", "cookies.txt", "Cookies.txt"]
 
-    # If env path points to /etc/secrets, also try the same basename in common places
-    basename = os.path.basename(src_path_env) if src_path_env else "cookies.txt"
-
-    # Standard Render mount
-    candidates.append(os.path.join("/etc/secrets", basename))
-
-    # App root / current working dir fallbacks
-    candidates.append(basename)
-    candidates.append(os.path.join(os.getcwd(), basename))
-    candidates.append(os.path.join("/opt/render/project/src", basename))
-
-    # Pick the first existing candidate
-    src_path = next((c for c in candidates if c and os.path.exists(c)), "")
-
-    if src_path:
-        tmp_path = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
+    src_path = None
+    for p in candidates:
         try:
-            shutil.copyfile(src_path, tmp_path)
-            try:
-                os.chmod(tmp_path, 0o600)
-            except Exception:
-                pass
-            _COOKIEFILE_PATH = tmp_path
-            _warn_if_suspicious(_COOKIEFILE_PATH)
-            return _COOKIEFILE_PATH
-        except Exception as e:
-            # If copying failed for any reason, fall back to the original path
-            log.warning("Cookie faylini /tmp ga ko'chirish xatosi: %s", e)
-            _COOKIEFILE_PATH = src_path
-            _warn_if_suspicious(_COOKIEFILE_PATH)
-            return _COOKIEFILE_PATH
+            if p and os.path.exists(p) and os.path.getsize(p) > 0:
+                src_path = p
+                break
+        except Exception:
+            continue
 
-    # Nothing found: log minimal debug hints (no sensitive contents)
-    if src_path_env:
-        log.warning("YT_COOKIES_FILE topildi, lekin fayl yo'q: %s", src_path_env)
+    if not src_path:
+        if src:
+            log.warning("YT_COOKIES_FILE topildi, lekin fayl yo'q: %s", src)
+        return None
+
     try:
-        if os.path.isdir("/etc/secrets"):
-            log.info("/etc/secrets ro'yxati: %s", ", ".join(sorted(os.listdir("/etc/secrets"))))
-    except Exception:
-        pass
-    return None
+        tmp_path = _dst_path()
+        shutil.copyfile(src_path, tmp_path)
+        _warn_if_suspicious(tmp_path)
+        log.info("YT cookies (file) tayyor: %s (exists=%s, size=%s, src=%s)", tmp_path, os.path.exists(tmp_path), os.path.getsize(tmp_path), src_path)
+        return tmp_path
+    except Exception as e:
+        log.warning("YT cookies copy xatosi: %s", e)
+        return None
 
 
-def _friendly_ydl_error(err: Exception, lang: str) -> str:
-    s = str(err) if err is not None else "Unknown error"
-    if "File name too long" in s or "Errno 36" in s:
-        return _t(lang, "err_filename_too_long")
-    if ("Sign in to confirm" in s) and ("not a bot" in s):
-        return _t(lang, "yt_need_cookies")
-    return s
-
-# ---------------------------- yt-dlp helpers ----------------------------
-
-def build_ydl_base(outtmpl: str) -> Dict[str, Any]:
+def build_ydl_base(outtmpl: str, workdir: Optional[str] = None) -> Dict[str, Any]:
     opts = {
         "outtmpl": outtmpl,
         "noplaylist": True,
@@ -585,18 +554,9 @@ def build_ydl_base(outtmpl: str) -> Dict[str, Any]:
 
 
     # Cookies (YouTube datacenter bloklari uchun foydali)
-    cookiefile = _ensure_cookiefile()
+    cookiefile = _ensure_cookiefile(workdir)
     if cookiefile:
         opts["cookiefile"] = cookiefile
-        # Log only once per process to confirm cookies are actually in use (no contents printed).
-        global _COOKIE_LOGGED
-        try:
-            if not _COOKIE_LOGGED:
-                sz = os.path.getsize(cookiefile) if os.path.exists(cookiefile) else -1
-                log.info("YT cookies ishlatilmoqda: %s (exists=%s, size=%s)", cookiefile, os.path.exists(cookiefile), sz)
-                _COOKIE_LOGGED = True
-        except Exception:
-            pass
 
     # YouTube extractor: ba'zan android client yumshoqroq ishlaydi
     opts.setdefault("extractor_args", {})
@@ -608,6 +568,10 @@ def build_ydl_base(outtmpl: str) -> Dict[str, Any]:
     if ua:
         opts.setdefault("http_headers", {})
         opts["http_headers"]["User-Agent"] = ua
+    # Proxy (ixtiyoriy): YTDLP_PROXY=http://user:pass@host:port
+    proxy = (os.getenv("YTDLP_PROXY") or "").strip()
+    if proxy:
+        opts["proxy"] = proxy
 
     return opts
 
@@ -615,7 +579,7 @@ def _extract_info(url: str) -> Dict[str, Any]:
     # Formatlarni ko‘rsatish uchun "process=False" ishlatamiz:
     # bu format tanlash (format selection) bosqichini chetlab o‘tadi va
     # "Requested format is not available" xatosini ko‘p holatda yo‘q qiladi.
-    ydl_opts = build_ydl_base(outtmpl="%(title)s.%(ext)s")
+    ydl_opts = build_ydl_base(outtmpl="%(title)s.%(ext)s", workdir=tempfile.gettempdir())
     ydl_opts["ignore_no_formats_error"] = True
     with YoutubeDL(ydl_opts) as ydl:
         return ydl.extract_info(url, download=False, process=False)
@@ -694,7 +658,7 @@ def _download_video(url: str, format_id: Optional[str], workdir: str) -> Path:
 
         raise RuntimeError("ERROR: The downloaded file is empty")
 
-    ydl_opts = build_ydl_base(outtmpl=outtmpl)
+    ydl_opts = build_ydl_base(outtmpl=outtmpl, workdir=workdir)
 
     if format_id:
         ydl_opts["format"] = f"{format_id}+bestaudio/{format_id}/best"
@@ -714,7 +678,7 @@ def _download_video(url: str, format_id: Optional[str], workdir: str) -> Path:
 def _download_audio(url: str, workdir: str) -> Path:
     outtmpl = os.path.join(workdir, "%(id)s.%(ext)s")
 
-    ydl_opts = build_ydl_base(outtmpl=outtmpl)
+    ydl_opts = build_ydl_base(outtmpl=outtmpl, workdir=workdir)
     ydl_opts["format"] = "bestaudio/best"
     ydl_opts["postprocessors"] = [{
         "key": "FFmpegExtractAudio",
@@ -730,7 +694,7 @@ def _download_audio(url: str, workdir: str) -> Path:
     except Exception as e:
         log.warning("MP3 konvertatsiya muvaffaqiyatsiz (ffmpeg yo'q bo'lishi mumkin). Fallback audio: %s", e)
 
-    ydl_opts2 = build_ydl_base(outtmpl=outtmpl)
+    ydl_opts2 = build_ydl_base(outtmpl=outtmpl, workdir=workdir)
     ydl_opts2["format"] = "bestaudio/best"
     with YoutubeDL(ydl_opts2) as ydl:
         info = ydl.extract_info(url, download=True)
