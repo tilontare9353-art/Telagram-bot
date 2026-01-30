@@ -39,6 +39,7 @@ import json
 import asyncio
 import logging
 import tempfile
+import shutil
 import secrets
 import base64
 from pathlib import Path
@@ -434,49 +435,49 @@ def _cache_get(token: str) -> Optional[Dict[str, Any]]:
 
 _COOKIEFILE_PATH: Optional[str] = None
 
-
 def _ensure_cookiefile() -> Optional[str]:
-    """Return a writable cookies.txt path for yt-dlp (Render secret files are read-only).
+    """Return a **writable** path to cookies.txt if provided via env.
 
-    Priority:
-      1) YT_COOKIES_FILE (path) — if read-only, copy to /tmp and use the copy
-      2) YT_COOKIES_B64 (base64 content) — decode to /tmp/yt_cookies.txt
+    Render secret files are mounted under /etc/secrets and are **read-only**.
+    yt-dlp will try to save cookies on exit, so we must copy the secret file
+    to a writable location (e.g. /tmp) and pass that path to yt-dlp.
+
+    Env options:
+    - YT_COOKIES_FILE: path to cookies.txt (e.g. /etc/secrets/cookies.txt)
+    - YT_COOKIES_B64: base64 string of cookies.txt (alternative)
     """
-    # 1) Path provided
-    pth = (os.getenv("YT_COOKIES_FILE") or "").strip()
-    if pth:
-        p = Path(pth)
-        if p.exists() and p.is_file():
-            # Render Secret Files live under /etc/secrets and are read-only.
-            # yt-dlp tries to *save* cookies on exit, so we must give it a writable file.
-            if os.access(str(p), os.W_OK):
-                return str(p)
-            try:
-                tmp = Path(tempfile.gettempdir()) / f"yt_cookies_{p.name}"
-                tmp.write_bytes(p.read_bytes())
-                try:
-                    os.chmod(tmp, 0o600)
-                except Exception:
-                    pass
-                return str(tmp)
-            except Exception:
-                # Fall through to base64 option
-                pass
-
-    # 2) Base64 provided
+    # 1) Base64 variant (best for env-only setups)
     b64 = (os.getenv("YT_COOKIES_B64") or "").strip()
     if b64:
         try:
-            raw = base64.b64decode(b64.encode("utf-8"), validate=False)
-            tmp = Path(tempfile.gettempdir()) / "yt_cookies.txt"
-            tmp.write_bytes(raw)
+            data = base64.b64decode(b64.encode("utf-8"))
+            tmp_path = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
+            with open(tmp_path, "wb") as f:
+                f.write(data)
             try:
-                os.chmod(tmp, 0o600)
+                os.chmod(tmp_path, 0o600)
             except Exception:
                 pass
-            return str(tmp)
-        except Exception:
-            return None
+            return tmp_path
+        except Exception as e:
+            logger.warning(f"YT_COOKIES_B64 decode xatosi: {e}")
+
+    # 2) File path variant (Render Secret Files are read-only)
+    src_path = (os.getenv("YT_COOKIES_FILE") or "").strip()
+    if src_path and os.path.exists(src_path):
+        tmp_path = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
+        try:
+            shutil.copyfile(src_path, tmp_path)
+            try:
+                os.chmod(tmp_path, 0o600)
+            except Exception:
+                pass
+            return tmp_path
+        except Exception as e:
+            # If copying failed for any reason, fall back to the original path
+            # (may still work if filesystem is writable).
+            logger.warning(f"Cookie faylini /tmp ga ko'chirish xatosi: {e}")
+            return src_path
 
     return None
 
