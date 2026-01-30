@@ -1,4 +1,4 @@
-python-telegram-bot[webhooks]==21.6
+python-telegram-bot>=20.7
 yt-dlp
-python-dotenv==1.0.1
-asyncpg==0.31.0
+asyncpg
+python-dotenv
