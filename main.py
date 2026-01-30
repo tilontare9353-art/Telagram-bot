@@ -108,7 +108,7 @@ LANG_UZ = "uz"
 LANG_RU = "ru"
 
 START_TEXT_UZ = (
-    "👋🏻 Salom\n"
+    "👋🏻 <b>Salom</b>\n"
     "Telegramdagi YouTube’dan, Tiktokdan, Instagram va Focebookdan video, audiolarni yuklab olish uchun eng tezkor "
     f"{BOT_USERNAME_TAG} ga xush kelibsiz.\n\n"
     "✅ Botning imkoniyatlari:\n"
@@ -170,6 +170,15 @@ TEXT = {
     "fmt_error": {
         LANG_UZ: "❌ Formatlarni olishda xatolik: {err}",
         LANG_RU: "❌ Ошибка при получении форматов: {err}",
+    },
+
+    "err_filename_too_long": {
+        LANG_UZ: "❌ Fayl nomi juda uzun bo‘lib кетди (server cheklovi). Boshqa variantni tanlang yoki linkni qayta yuboring.",
+        LANG_RU: "❌ Слишком длинное имя файла (ограничение сервера). Выберите другой вариант или отправьте ссылку заново.",
+    },
+    "yt_need_cookies": {
+        LANG_UZ: "❌ YouTube «men robot emasman» tekshiruvini so‘radi. Render’да YouTube ishlashi uchun cookie (cookies.txt) kerak.",
+        LANG_RU: "❌ YouTube требует подтверждение «я не бот». На Render для YouTube нужны cookies (cookies.txt).",
     },
     "err_generic": {LANG_UZ: "❌ Xatolik: {err}", LANG_RU: "❌ Ошибка: {err}"},
     "not_admin": {LANG_UZ: "❌ Siz admin emassiz.", LANG_RU: "❌ Вы не админ."},
@@ -459,9 +468,9 @@ def _ensure_cookiefile() -> Optional[str]:
 def _friendly_ydl_error(err: Exception, lang: str) -> str:
     s = str(err) if err is not None else "Unknown error"
     if "File name too long" in s or "Errno 36" in s:
-        return _t("err_filename_too_long", lang)
+        return _t(lang, "err_filename_too_long")
     if ("Sign in to confirm" in s) and ("not a bot" in s):
-        return _t("yt_need_cookies", lang)
+        return _t(lang, "yt_need_cookies")
     return s
 
 # ---------------------------- yt-dlp helpers ----------------------------
@@ -866,7 +875,7 @@ async def _task_show_youtube_formats(
             await context.bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=message_id,
-                text=_t(lang, "fmt_error", err=str(e)),
+                text=_t(lang, "fmt_error", err=_friendly_ydl_error(e, lang)),
             )
         except Exception:
             pass
@@ -1001,7 +1010,7 @@ async def _task_download_and_send(
         try:
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=_t(lang, "err_generic", err=str(e)),
+                text=_t(lang, "err_generic", err=_friendly_ydl_error(e, lang)),
                 reply_to_message_id=reply_to_message_id,
             )
         except Exception:
