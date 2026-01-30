@@ -30,8 +30,12 @@ Eslatma:
 - MP3 konvertatsiya uchun ffmpeg tavsiya qilinadi. Bo'lmasa m4a/webm audio yuboriladi.
 """
 
-from dotenv import load_dotenv
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    # python-dotenv is optional on Render
+    pass
 
 import os
 import re
@@ -178,8 +182,8 @@ TEXT = {
         LANG_RU: "❌ Слишком длинное имя файла (ограничение сервера). Выберите другой вариант или отправьте ссылку заново.",
     },
     "yt_need_cookies": {
-        LANG_UZ: "❌ YouTube «men robot emasman» tekshiruvini so‘radi. Render’да YouTube ishlashi uchun cookie (cookies.txt) kerak.",
-        LANG_RU: "❌ YouTube требует подтверждение «я не бот». На Render для YouTube нужны cookies (cookies.txt).",
+        LANG_UZ: "❌ YouTube «men robot emasman» tekshiruvini so‘radi. Render’da YouTube ishlashi uchun браузердан экспорт қилинган Netscape formatdagi cookies.txt kerak.",
+        LANG_RU: "❌ YouTube требует подтверждение «я не бот». На Render для YouTube нужен cookies.txt, экспортированный из браузера (формат Netscape).",
     },
     "err_generic": {LANG_UZ: "❌ Xatolik: {err}", LANG_RU: "❌ Ошибка: {err}"},
     "not_admin": {LANG_UZ: "❌ Siz admin emassiz.", LANG_RU: "❌ Вы не админ."},
@@ -439,18 +443,41 @@ def _ensure_cookiefile() -> Optional[str]:
     """Return a **writable** path to cookies.txt if provided via env.
 
     Render secret files are mounted under /etc/secrets and are **read-only**.
-    yt-dlp will try to save cookies on exit, so we must copy the secret file
-    to a writable location (e.g. /tmp) and pass that path to yt-dlp.
+    yt-dlp may update cookies on exit, so we copy the secret file to a writable
+    location (e.g. /tmp) and pass that path to yt-dlp.
 
     Env options:
     - YT_COOKIES_FILE: path to cookies.txt (e.g. /etc/secrets/cookies.txt)
     - YT_COOKIES_B64: base64 string of cookies.txt (alternative)
     """
+    global _COOKIEFILE_PATH
+
+    # If already prepared and still exists, reuse (avoid copying every request)
+    if _COOKIEFILE_PATH and os.path.exists(_COOKIEFILE_PATH):
+        return _COOKIEFILE_PATH
+
+    def _warn_if_suspicious(path: str) -> None:
+        """Best-effort sanity checks (doesn't print cookie contents)."""
+        try:
+            sz = os.path.getsize(path)
+            if sz <= 0:
+                log.warning("YT cookies file is empty: %s", path)
+                return
+            # Check only the first line for Netscape header
+            with open(path, "rb") as f:
+                head = f.read(256)
+            head_txt = head.decode("utf-8", errors="ignore").strip()
+            if head_txt and ("Netscape" not in head_txt) and ("# HTTP Cookie File" not in head_txt):
+                # Not always required, but usually indicates wrong export format
+                log.warning("YT cookies file may be in a non-Netscape format: %s", path)
+        except Exception:
+            pass
+
     # 1) Base64 variant (best for env-only setups)
     b64 = (os.getenv("YT_COOKIES_B64") or "").strip()
     if b64:
         try:
-            data = base64.b64decode(b64.encode("utf-8"))
+            data = base64.b64decode(b64.encode("utf-8"), validate=False)
             tmp_path = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
             with open(tmp_path, "wb") as f:
                 f.write(data)
@@ -458,13 +485,19 @@ def _ensure_cookiefile() -> Optional[str]:
                 os.chmod(tmp_path, 0o600)
             except Exception:
                 pass
-            return tmp_path
+            _COOKIEFILE_PATH = tmp_path
+            _warn_if_suspicious(_COOKIEFILE_PATH)
+            return _COOKIEFILE_PATH
         except Exception as e:
-            logger.warning(f"YT_COOKIES_B64 decode xatosi: {e}")
+            log.warning("YT_COOKIES_B64 decode xatosi: %s", e)
 
     # 2) File path variant (Render Secret Files are read-only)
     src_path = (os.getenv("YT_COOKIES_FILE") or "").strip()
-    if src_path and os.path.exists(src_path):
+    if src_path:
+        if not os.path.exists(src_path):
+            log.warning("YT_COOKIES_FILE topildi, lekin fayl yo'q: %s", src_path)
+            return None
+
         tmp_path = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
         try:
             shutil.copyfile(src_path, tmp_path)
@@ -472,15 +505,17 @@ def _ensure_cookiefile() -> Optional[str]:
                 os.chmod(tmp_path, 0o600)
             except Exception:
                 pass
-            return tmp_path
+            _COOKIEFILE_PATH = tmp_path
+            _warn_if_suspicious(_COOKIEFILE_PATH)
+            return _COOKIEFILE_PATH
         except Exception as e:
             # If copying failed for any reason, fall back to the original path
-            # (may still work if filesystem is writable).
-            logger.warning(f"Cookie faylini /tmp ga ko'chirish xatosi: {e}")
-            return src_path
+            log.warning("Cookie faylini /tmp ga ko'chirish xatosi: %s", e)
+            _COOKIEFILE_PATH = src_path
+            _warn_if_suspicious(_COOKIEFILE_PATH)
+            return _COOKIEFILE_PATH
 
     return None
-
 
 
 def _friendly_ydl_error(err: Exception, lang: str) -> str:
