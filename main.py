@@ -108,7 +108,7 @@ LANG_UZ = "uz"
 LANG_RU = "ru"
 
 START_TEXT_UZ = (
-    "👋🏻 <b>Salom</b>\n"
+    "👋🏻 Salom\n"
     "Telegramdagi YouTube’dan, Tiktokdan, Instagram va Focebookdan video, audiolarni yuklab olish uchun eng tezkor "
     f"{BOT_USERNAME_TAG} ga xush kelibsiz.\n\n"
     "✅ Botning imkoniyatlari:\n"
@@ -434,33 +434,50 @@ def _cache_get(token: str) -> Optional[Dict[str, Any]]:
 
 _COOKIEFILE_PATH: Optional[str] = None
 
+
 def _ensure_cookiefile() -> Optional[str]:
-    """Return path to a cookies.txt file if provided via env.
-    - YT_COOKIES_FILE: absolute path (local use)
-    - YT_COOKIES_B64: base64 of cookies.txt (Render Secrets)
+    """Return a writable cookies.txt path for yt-dlp (Render secret files are read-only).
+
+    Priority:
+      1) YT_COOKIES_FILE (path) — if read-only, copy to /tmp and use the copy
+      2) YT_COOKIES_B64 (base64 content) — decode to /tmp/yt_cookies.txt
     """
-    global _COOKIEFILE_PATH
-    if _COOKIEFILE_PATH is not None:
-        return _COOKIEFILE_PATH or None
-
+    # 1) Path provided
     pth = (os.getenv("YT_COOKIES_FILE") or "").strip()
-    if pth and os.path.exists(pth):
-        _COOKIEFILE_PATH = pth
-        return pth
+    if pth:
+        p = Path(pth)
+        if p.exists() and p.is_file():
+            # Render Secret Files live under /etc/secrets and are read-only.
+            # yt-dlp tries to *save* cookies on exit, so we must give it a writable file.
+            if os.access(str(p), os.W_OK):
+                return str(p)
+            try:
+                tmp = Path(tempfile.gettempdir()) / f"yt_cookies_{p.name}"
+                tmp.write_bytes(p.read_bytes())
+                try:
+                    os.chmod(tmp, 0o600)
+                except Exception:
+                    pass
+                return str(tmp)
+            except Exception:
+                # Fall through to base64 option
+                pass
 
+    # 2) Base64 provided
     b64 = (os.getenv("YT_COOKIES_B64") or "").strip()
     if b64:
         try:
-            data = base64.b64decode(b64.encode("utf-8"))
-            tmp = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
-            with open(tmp, "wb") as f:
-                f.write(data)
-            _COOKIEFILE_PATH = tmp
-            return tmp
-        except Exception as e:
-            logging.warning("YT_COOKIES_B64 decode xatosi: %s", e)
+            raw = base64.b64decode(b64.encode("utf-8"), validate=False)
+            tmp = Path(tempfile.gettempdir()) / "yt_cookies.txt"
+            tmp.write_bytes(raw)
+            try:
+                os.chmod(tmp, 0o600)
+            except Exception:
+                pass
+            return str(tmp)
+        except Exception:
+            return None
 
-    _COOKIEFILE_PATH = ""
     return None
 
 
