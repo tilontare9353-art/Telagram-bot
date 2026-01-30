@@ -438,6 +438,7 @@ def _cache_get(token: str) -> Optional[Dict[str, Any]]:
 # ---------------------------- yt-dlp cookies helpers ----------------------------
 
 _COOKIEFILE_PATH: Optional[str] = None
+_COOKIE_LOGGED: bool = False
 
 def _ensure_cookiefile() -> Optional[str]:
     """Return a **writable** path to cookies.txt if provided via env.
@@ -476,8 +477,18 @@ def _ensure_cookiefile() -> Optional[str]:
     # 1) Base64 variant (best for env-only setups)
     b64 = (os.getenv("YT_COOKIES_B64") or "").strip()
     if b64:
-        try:
-            data = base64.b64decode(b64.encode("utf-8"), validate=False)
+        # Some users mistakenly paste the *PowerShell command* instead of its output.
+        # If it looks like a command, ignore it and fall back to YT_COOKIES_FILE.
+        if ("[Convert]::ToBase64String" in b64) or ("ReadAllBytes" in b64):
+            log.warning("YT_COOKIES_B64 qiymati base64 emas (buyruq matni ko‘rinadi). Uni o‘chirib tashlang yoki haqiqiy base64 natijani kiriting.")
+        else:
+            try:
+                # Remove whitespace/newlines, then auto-pad to a multiple of 4 (fixes 'Incorrect padding')
+                b64_clean = re.sub(r"\s+", "", b64)
+                pad = (-len(b64_clean)) % 4
+                if pad:
+                    b64_clean += "=" * pad
+                data = base64.b64decode(b64_clean.encode("utf-8"), validate=False)
             tmp_path = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
             with open(tmp_path, "wb") as f:
                 f.write(data)
@@ -577,6 +588,15 @@ def build_ydl_base(outtmpl: str) -> Dict[str, Any]:
     cookiefile = _ensure_cookiefile()
     if cookiefile:
         opts["cookiefile"] = cookiefile
+        # Log only once per process to confirm cookies are actually in use (no contents printed).
+        global _COOKIE_LOGGED
+        try:
+            if not _COOKIE_LOGGED:
+                sz = os.path.getsize(cookiefile) if os.path.exists(cookiefile) else -1
+                log.info("YT cookies ishlatilmoqda: %s (exists=%s, size=%s)", cookiefile, os.path.exists(cookiefile), sz)
+                _COOKIE_LOGGED = True
+        except Exception:
+            pass
 
     # YouTube extractor: ba'zan android client yumshoqroq ishlaydi
     opts.setdefault("extractor_args", {})
