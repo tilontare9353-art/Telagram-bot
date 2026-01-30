@@ -612,9 +612,13 @@ def build_ydl_base(outtmpl: str) -> Dict[str, Any]:
     return opts
 
 def _extract_info(url: str) -> Dict[str, Any]:
+    # Formatlarni ko‘rsatish uchun "process=False" ishlatamiz:
+    # bu format tanlash (format selection) bosqichini chetlab o‘tadi va
+    # "Requested format is not available" xatosini ko‘p holatda yo‘q qiladi.
     ydl_opts = build_ydl_base(outtmpl="%(title)s.%(ext)s")
+    ydl_opts["ignore_no_formats_error"] = True
     with YoutubeDL(ydl_opts) as ydl:
-        return ydl.extract_info(url, download=False)
+        return ydl.extract_info(url, download=False, process=False)
 
 def _select_youtube_formats(info: Dict[str, Any]) -> List[Dict[str, Any]]:
     formats = info.get("formats") or []
@@ -693,7 +697,7 @@ def _download_video(url: str, format_id: Optional[str], workdir: str) -> Path:
     ydl_opts = build_ydl_base(outtmpl=outtmpl)
 
     if format_id:
-        ydl_opts["format"] = f"{format_id}+bestaudio/best"
+        ydl_opts["format"] = f"{format_id}+bestaudio/{format_id}/best"
         ydl_opts["merge_output_format"] = "mp4"
     else:
         ydl_opts["format"] = "bv*+ba/best"
