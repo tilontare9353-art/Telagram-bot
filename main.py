@@ -823,6 +823,13 @@ def _extract_info(url: str) -> Dict[str, Any]:
     ydl_opts = build_ydl_base(outtmpl="%(title)s.%(ext)s", workdir=tempfile.gettempdir())
     ydl_opts["ignore_no_formats_error"] = True
     ydl_opts["skip_download"] = True
+    # Format ro'yxatini olishda "web" client ko'proq formatlarni qaytaradi.
+    try:
+        ydl_opts.setdefault("extractor_args", {})
+        ydl_opts["extractor_args"].setdefault("youtube", {})
+        ydl_opts["extractor_args"]["youtube"]["player_client"] = ["web", "android", "ios"]
+    except Exception:
+        pass
     try:
         with YoutubeDL(ydl_opts) as ydl:
             return ydl.extract_info(url, download=False)
@@ -976,8 +983,23 @@ def _download_video(url: str, format_id: Optional[str], workdir: str) -> Path:
     ydl_opts = build_ydl_base(outtmpl=outtmpl, workdir=workdir)
 
     if format_id:
-        ydl_opts["format"] = f"{format_id}+bestaudio/{format_id}/best"
-        ydl_opts["merge_output_format"] = "mp4"
+        # Special pseudo format: "h:720" means request max height <= 720
+        if isinstance(format_id, str) and format_id.lower().startswith("h:"):
+            try:
+                hmax = int(format_id.split(":", 1)[1])
+            except Exception:
+                hmax = 360
+            # Prefer mp4 video + m4a audio, fallback to best within height cap
+            ydl_opts["format"] = (
+                f"bv*[height<={hmax}][ext=mp4]+ba[ext=m4a]/"
+                f"bv*[height<={hmax}]+ba/"
+                f"b[height<={hmax}][ext=mp4]/b[height<={hmax}]/best"
+            )
+            ydl_opts["merge_output_format"] = "mp4"
+        else:
+            # Exact itag / format_id
+            ydl_opts["format"] = f"{format_id}+bestaudio/{format_id}/best"
+            ydl_opts["merge_output_format"] = "mp4"
     else:
         ydl_opts["format"] = "bv*+ba/best"
         ydl_opts["merge_output_format"] = "mp4"
@@ -1269,6 +1291,14 @@ async def _task_show_youtube_formats(
     try:
         info = await loop.run_in_executor(None, _extract_info, url)
         formats = _select_youtube_formats(info)
+
+        # Agar yt-dlp faqat bitta video format qaytarsa (ko'pincha 360p atrofida),
+        # UI baribir 144/240/360/480/720 variantlarni ko'rsatadi.
+        # Bu variantlar "h:XXX" pseudo format bo'lib, yuklash paytida height cap sifatida ishlatiladi.
+        if not formats or len(formats) < 2:
+            formats = []
+            for h in (144, 240, 360, 480, 720):
+                formats.append({"format_id": f"h:{h}", "height": h, "_label_h": h})
 
         # Buttonlar: faqat 144/240/360/480/720 (mavjud bo‘lsa)
         btns: List[InlineKeyboardButton] = []
