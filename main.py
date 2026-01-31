@@ -533,7 +533,8 @@ def _best_audio_size_bytes(info: Dict[str, Any]) -> int:
     dur = info.get("duration")
     auds = [f for f in formats if f.get("vcodec") == "none" and f.get("acodec") != "none"]
     if not auds:
-        return 0
+        # fallback: assume ~128 kbps audio if duration is known
+        return _estimate_bytes_from_kbps(128.0, dur)
 
     def score(a: Dict[str, Any]) -> Tuple[float, int]:
         abr = float(a.get("abr") or 0.0)
@@ -547,19 +548,53 @@ def _best_audio_size_bytes(info: Dict[str, Any]) -> int:
     sz = int(best.get("filesize") or best.get("filesize_approx") or 0)
     if sz > 0:
         return sz
+
     kbps = float(best.get("tbr") or best.get("abr") or 0.0)
-    return _estimate_bytes_from_kbps(kbps, dur)
+    est = _estimate_bytes_from_kbps(kbps, dur)
+    if est > 0:
+        return est
+
+    # last fallback: assume ~128 kbps audio if nothing else is available
+    return _estimate_bytes_from_kbps(128.0, dur)
+
+
+def _fallback_video_kbps(height: int) -> float:
+    """Heuristic bitrate (kbps) to estimate size when yt-dlp doesn't provide filesize/tbr."""
+    h = int(height or 0)
+    if h <= 144:
+        return 250.0
+    if h <= 240:
+        return 400.0
+    if h <= 360:
+        return 800.0
+    if h <= 480:
+        return 1200.0
+    if h <= 720:
+        return 2500.0
+    if h <= 1080:
+        return 4500.0
+    return 6500.0
+
 
 def _video_total_size_bytes(info: Dict[str, Any], f: Dict[str, Any]) -> int:
     dur = info.get("duration")
+
     sz = int(f.get("filesize") or f.get("filesize_approx") or 0)
     if sz <= 0:
         kbps = float(f.get("tbr") or 0.0)
+        if kbps <= 0:
+            # pseudo formats (h:360) and some YouTube entries can miss tbr/filesize;
+            # estimate from resolution heuristics so button labels show sizes.
+            h = int(f.get("_label_h") or f.get("height") or 0)
+            kbps = _fallback_video_kbps(h)
         sz = _estimate_bytes_from_kbps(kbps, dur)
+
     # If this format has no audio, add best audio size for display
     if (f.get("acodec") == "none") or not f.get("acodec"):
         sz += _best_audio_size_bytes(info)
+
     return sz
+
 
 def _pick_best_thumbnail_url(info: Dict[str, Any]) -> Optional[str]:
     # yt-dlp may provide 'thumbnail' and list 'thumbnails'
@@ -823,6 +858,13 @@ def _extract_info(url: str) -> Dict[str, Any]:
     ydl_opts = build_ydl_base(outtmpl="%(title)s.%(ext)s", workdir=tempfile.gettempdir())
     ydl_opts["ignore_no_formats_error"] = True
     ydl_opts["skip_download"] = True
+    # Format ro'yxatini olishda "web" client ko'proq formatlarni qaytaradi.
+    try:
+        ydl_opts.setdefault("extractor_args", {})
+        ydl_opts["extractor_args"].setdefault("youtube", {})
+        ydl_opts["extractor_args"]["youtube"]["player_client"] = ["web", "android", "ios"]
+    except Exception:
+        pass
     try:
         with YoutubeDL(ydl_opts) as ydl:
             return ydl.extract_info(url, download=False)
@@ -976,8 +1018,23 @@ def _download_video(url: str, format_id: Optional[str], workdir: str) -> Path:
     ydl_opts = build_ydl_base(outtmpl=outtmpl, workdir=workdir)
 
     if format_id:
-        ydl_opts["format"] = f"{format_id}+bestaudio/{format_id}/best"
-        ydl_opts["merge_output_format"] = "mp4"
+        # Special pseudo format: "h:720" means request max height <= 720
+        if isinstance(format_id, str) and format_id.lower().startswith("h:"):
+            try:
+                hmax = int(format_id.split(":", 1)[1])
+            except Exception:
+                hmax = 360
+            # Prefer mp4 video + m4a audio, fallback to best within height cap
+            ydl_opts["format"] = (
+                f"bv*[height<={hmax}][ext=mp4]+ba[ext=m4a]/"
+                f"bv*[height<={hmax}]+ba/"
+                f"b[height<={hmax}][ext=mp4]/b[height<={hmax}]/best"
+            )
+            ydl_opts["merge_output_format"] = "mp4"
+        else:
+            # Exact itag / format_id
+            ydl_opts["format"] = f"{format_id}+bestaudio/{format_id}/best"
+            ydl_opts["merge_output_format"] = "mp4"
     else:
         ydl_opts["format"] = "bv*+ba/best"
         ydl_opts["merge_output_format"] = "mp4"
@@ -1269,6 +1326,14 @@ async def _task_show_youtube_formats(
     try:
         info = await loop.run_in_executor(None, _extract_info, url)
         formats = _select_youtube_formats(info)
+
+        # Agar yt-dlp faqat bitta video format qaytarsa (ko'pincha 360p atrofida),
+        # UI baribir 144/240/360/480/720 variantlarni ko'rsatadi.
+        # Bu variantlar "h:XXX" pseudo format bo'lib, yuklash paytida height cap sifatida ishlatiladi.
+        if not formats or len(formats) < 2:
+            formats = []
+            for h in (144, 240, 360, 480, 720):
+                formats.append({"format_id": f"h:{h}", "height": h, "_label_h": h})
 
         # Buttonlar: faqat 144/240/360/480/720 (mavjud bo‘lsa)
         btns: List[InlineKeyboardButton] = []
