@@ -823,8 +823,18 @@ def _extract_info(url: str) -> Dict[str, Any]:
     ydl_opts = build_ydl_base(outtmpl="%(title)s.%(ext)s", workdir=tempfile.gettempdir())
     ydl_opts["ignore_no_formats_error"] = True
     ydl_opts["skip_download"] = True
-    with YoutubeDL(ydl_opts) as ydl:
-        return ydl.extract_info(url, download=False)
+    try:
+        with YoutubeDL(ydl_opts) as ydl:
+            return ydl.extract_info(url, download=False)
+    except Exception as e:
+        msg = str(e)
+        if "Impersonate target" in msg and "not available" in msg:
+            # Railway/host muhitida curl-cffi yoki kerakli handler bo‘lmasa, impersonate target mavjud bo‘lmay qoladi.
+            ydl_opts.pop("impersonate", None)
+            log.warning("Impersonate o‘chirildi (mavjud emas): %s", msg)
+            with YoutubeDL(ydl_opts) as ydl:
+                return ydl.extract_info(url, download=False)
+        raise
 
 def _select_youtube_formats(info: Dict[str, Any]) -> List[Dict[str, Any]]:
     formats = info.get("formats") or []
@@ -865,42 +875,54 @@ def _download_video(url: str, format_id: Optional[str], workdir: str) -> Path:
     outtmpl = os.path.join(workdir, "%(id)s.%(ext)s")
 
     def _run_with_opts(opts: Dict[str, Any]) -> Path:
-        with YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
+        def _do(local_opts: Dict[str, Any]) -> Path:
+            with YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
 
-            candidates: List[Path] = []
-            try:
-                fp = ydl.prepare_filename(info)
-                candidates.append(Path(fp))
-            except Exception:
-                pass
-
-            try:
-                for rd in (info.get("requested_downloads") or []):
-                    p = rd.get("filepath")
-                    if p:
-                        candidates.append(Path(p))
-            except Exception:
-                pass
-
-            try:
-                files = sorted(
-                    Path(workdir).glob("*"),
-                    key=lambda x: x.stat().st_mtime,
-                    reverse=True,
-                )
-                candidates.extend(files)
-            except Exception:
-                pass
-
-            for p in candidates:
+                candidates: List[Path] = []
                 try:
-                    if p.exists() and p.is_file() and p.stat().st_size > 0:
-                        return p
+                    fp = ydl.prepare_filename(info)
+                    candidates.append(Path(fp))
                 except Exception:
-                    continue
+                    pass
 
-        raise RuntimeError("ERROR: The downloaded file is empty")
+                try:
+                    for rd in (info.get("requested_downloads") or []):
+                        p = rd.get("filepath")
+                        if p:
+                            candidates.append(Path(p))
+                except Exception:
+                    pass
+
+                try:
+                    files = sorted(
+                        Path(workdir).glob("*"),
+                        key=lambda x: x.stat().st_mtime,
+                        reverse=True,
+                    )
+                    candidates.extend(files)
+                except Exception:
+                    pass
+
+                for p in candidates:
+                    try:
+                        if p.exists() and p.is_file() and p.stat().st_size > 0:
+                            return p
+                    except Exception:
+                        continue
+
+            raise RuntimeError("ERROR: The downloaded file is empty")
+
+        try:
+            return _do(opts)
+        except Exception as e:
+            msg = str(e)
+            if "Impersonate target" in msg and "not available" in msg:
+                opts.pop("impersonate", None)
+                log.warning("Impersonate o‘chirildi (mavjud emas): %s", msg)
+                return _do(opts)
+            raise
+
 
     ydl_opts = build_ydl_base(outtmpl=outtmpl, workdir=workdir)
 
@@ -930,8 +952,18 @@ def _download_audio(url: str, workdir: str) -> Path:
         "preferredquality": "192",
     }]
     try:
-        with YoutubeDL(ydl_opts) as ydl:
-            ydl.extract_info(url, download=True)
+        try:
+            with YoutubeDL(ydl_opts) as ydl:
+                ydl.extract_info(url, download=True)
+        except Exception as e:
+            msg = str(e)
+            if "Impersonate target" in msg and "not available" in msg:
+                ydl_opts.pop("impersonate", None)
+                log.warning("Impersonate o‘chirildi (mavjud emas): %s", msg)
+                with YoutubeDL(ydl_opts) as ydl:
+                    ydl.extract_info(url, download=True)
+            else:
+                raise
         mp3s = sorted(Path(workdir).glob("*.mp3"), key=lambda x: x.stat().st_mtime, reverse=True)
         if mp3s:
             return mp3s[0]
@@ -940,8 +972,18 @@ def _download_audio(url: str, workdir: str) -> Path:
 
     ydl_opts2 = build_ydl_base(outtmpl=outtmpl, workdir=workdir)
     ydl_opts2["format"] = "bestaudio/best"
-    with YoutubeDL(ydl_opts2) as ydl:
-        info = ydl.extract_info(url, download=True)
+    try:
+        with YoutubeDL(ydl_opts2) as ydl:
+            info = ydl.extract_info(url, download=True)
+    except Exception as e:
+        msg = str(e)
+        if "Impersonate target" in msg and "not available" in msg:
+            ydl_opts2.pop("impersonate", None)
+            log.warning("Impersonate o‘chirildi (mavjud emas): %s", msg)
+            with YoutubeDL(ydl_opts2) as ydl:
+                info = ydl.extract_info(url, download=True)
+        else:
+            raise
         fp = ydl.prepare_filename(info)
         p = Path(fp)
         if p.exists():
