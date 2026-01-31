@@ -47,6 +47,9 @@ import tempfile
 import shutil
 import secrets
 import base64
+import html
+import subprocess
+import zipfile
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
 
@@ -175,6 +178,15 @@ TEXT = {
     "choose": {LANG_UZ: "Tanlang:", LANG_RU: "Выберите:"},
     "btn_video": {LANG_UZ: "📹 Video yuklab olish", LANG_RU: "📹 Скачать видео"},
     "btn_audio": {LANG_UZ: "🎵 Audio", LANG_RU: "🎵 Аудио"},
+    "btn_tt_photo": {LANG_UZ: "🖼 Foto post (ZIP)", LANG_RU: "🖼 Фото-пост (ZIP)"},
+    "tt_photo_only": {
+        LANG_UZ: "Bu TikTok foto-post (/photo/). Rasmlarni ZIP ko‘rinishida yuklab oling:",
+        LANG_RU: "Это TikTok фото-пост (/photo/). Скачайте картинки в ZIP:",
+    },
+    "yt_caption": {
+        LANG_UZ: "📹 <b>{title}</b>\n⏱ {dur}\n\n<b>Formatni tanlang:</b>",
+        LANG_RU: "📹 <b>{title}</b>\n⏱ {dur}\n\n<b>Выберите формат:</b>",
+    },
     "yt_choose_fmt": {
         LANG_UZ: "Formatni tanlang (YouTube):",
         LANG_RU: "Выберите формат (YouTube):",
@@ -445,6 +457,87 @@ def human_mb(num_bytes: Optional[int]) -> Optional[str]:
         return None
     return f"{num_bytes / (1024 * 1024):.1f}MB"
 
+
+def human_mb_compact(num_bytes: Optional[int]) -> Optional[str]:
+    if not num_bytes or num_bytes <= 0:
+        return None
+    mb = num_bytes / (1024 * 1024)
+    if mb >= 10:
+        return f"{mb:.0f}MB"
+    return f"{mb:.1f}MB"
+
+def human_duration(seconds: Optional[float]) -> str:
+    if not seconds or seconds <= 0:
+        return "-"
+    s = int(seconds)
+    h = s // 3600
+    m = (s % 3600) // 60
+    ss = s % 60
+    if h > 0:
+        return f"{h:d}:{m:02d}:{ss:02d}"
+    return f"{m:d}:{ss:02d}"
+
+def is_tiktok(url: str) -> bool:
+    return "tiktok.com" in (url or "").lower()
+
+def is_tiktok_photo(url: str) -> bool:
+    u = (url or "").lower()
+    return ("tiktok.com" in u) and ("/photo/" in u)
+
+def _estimate_bytes_from_kbps(kbps: Optional[float], duration_s: Optional[float]) -> int:
+    if not kbps or not duration_s or kbps <= 0 or duration_s <= 0:
+        return 0
+    # kbps -> bytes
+    return int((kbps * 1000 / 8) * duration_s)
+
+def _best_audio_size_bytes(info: Dict[str, Any]) -> int:
+    formats = info.get("formats") or []
+    dur = info.get("duration")
+    auds = [f for f in formats if f.get("vcodec") == "none" and f.get("acodec") != "none"]
+    if not auds:
+        return 0
+
+    def score(a: Dict[str, Any]) -> Tuple[float, int]:
+        abr = float(a.get("abr") or 0.0)
+        tbr = float(a.get("tbr") or 0.0)
+        # prefer m4a, then higher bitrate
+        ext = (a.get("ext") or "").lower()
+        ext_score = 2 if ext == "m4a" else (1 if ext in ("mp4", "aac") else 0)
+        return (ext_score * 1000 + max(abr, tbr), int(a.get("filesize") or a.get("filesize_approx") or 0))
+
+    best = sorted(auds, key=score, reverse=True)[0]
+    sz = int(best.get("filesize") or best.get("filesize_approx") or 0)
+    if sz > 0:
+        return sz
+    kbps = float(best.get("tbr") or best.get("abr") or 0.0)
+    return _estimate_bytes_from_kbps(kbps, dur)
+
+def _video_total_size_bytes(info: Dict[str, Any], f: Dict[str, Any]) -> int:
+    dur = info.get("duration")
+    sz = int(f.get("filesize") or f.get("filesize_approx") or 0)
+    if sz <= 0:
+        kbps = float(f.get("tbr") or 0.0)
+        sz = _estimate_bytes_from_kbps(kbps, dur)
+    # If this format has no audio, add best audio size for display
+    if (f.get("acodec") == "none") or not f.get("acodec"):
+        sz += _best_audio_size_bytes(info)
+    return sz
+
+def _pick_best_thumbnail_url(info: Dict[str, Any]) -> Optional[str]:
+    # yt-dlp may provide 'thumbnail' and list 'thumbnails'
+    t = info.get("thumbnail")
+    if t:
+        return t
+    thumbs = info.get("thumbnails") or []
+    if not thumbs:
+        return None
+    # pick biggest by width/height if present
+    def score(x: Dict[str, Any]) -> Tuple[int, int]:
+        return (int(x.get("width") or 0), int(x.get("height") or 0))
+    best = sorted(thumbs, key=score, reverse=True)[0]
+    return best.get("url")
+
+
 def _cache_put(payload: Dict[str, Any]) -> str:
     token = secrets.token_urlsafe(8)[:10]
     if len(CALLBACK_CACHE) >= CALLBACK_CACHE_MAX:
@@ -455,6 +548,30 @@ def _cache_put(payload: Dict[str, Any]) -> str:
 
 def _cache_get(token: str) -> Optional[Dict[str, Any]]:
     return CALLBACK_CACHE.get(token)
+
+
+def _friendly_ydl_error(e: Exception, lang: str) -> str:
+    """Minimal, user-friendly error text for logs from yt-dlp / download."""
+    s = str(e)
+    s_low = s.lower()
+
+    # YouTube bot-check patterns
+    if "sign in to confirm you’re not a bot" in s_low or "confirm you’re not a bot" in s_low:
+        # Cookies bor-yo‘qligini taxmin qilamiz
+        if (os.getenv("YT_COOKIES_B64") or os.getenv("YT_COOKIES_FILE")):
+            return _t(lang, "yt_botcheck_even_with_cookies")
+        return _t(lang, "yt_need_cookies")
+
+    if "unsupported url" in s_low:
+        return s
+
+    if "filename too long" in s_low:
+        return _t(lang, "err_filename_too_long")
+
+    # Default: qisqa qilib qaytaramiz
+    if len(s) > 250:
+        s = s[:247] + "..."
+    return s
 
 
 
@@ -591,6 +708,14 @@ def build_ydl_base(outtmpl: str, workdir: Optional[str] = None) -> Dict[str, Any
     if proxy:
         opts["proxy"] = proxy
 
+    # ffmpeg (merge/MP3 uchun) — Railway/Render'да PATH'da bo'lishi mumkin
+    try:
+        ff = shutil.which('ffmpeg')
+        if ff:
+            opts['ffmpeg_location'] = ff
+    except Exception:
+        pass
+
     return opts
 
 def _extract_info(url: str) -> Dict[str, Any]:
@@ -613,7 +738,7 @@ def _select_youtube_formats(info: Dict[str, Any]) -> List[Dict[str, Any]]:
             continue
         by_h.setdefault(h, []).append(f)
 
-    desired_heights = [144, 240, 360, 480, 720, 1080]
+    desired_heights = [144, 240, 360, 480, 720]
     picked: List[Dict[str, Any]] = []
 
     for h in desired_heights:
@@ -900,6 +1025,17 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
         )
     else:
+        # TikTok photo-post (/photo/) — video emas, rasmlar bo‘ladi
+        if is_tiktok_photo(url):
+            token_p = _cache_put({
+                "url": url, "kind": "tt_photo", "format_id": None,
+                "origin_chat_id": origin_chat_id, "origin_message_id": origin_message_id,
+                "lang": lang,
+            })
+            kb = [[InlineKeyboardButton(_t(lang, "btn_tt_photo"), callback_data=f"dl|{token_p}")]]
+            await update.message.reply_text(_t(lang, "tt_photo_only"), reply_markup=InlineKeyboardMarkup(kb))
+            return
+
         kb = []
         t_v = _cache_put({
             "url": url, "kind": "video", "format_id": None,
@@ -930,33 +1066,79 @@ async def _task_show_youtube_formats(
         info = await loop.run_in_executor(None, _extract_info, url)
         formats = _select_youtube_formats(info)
 
-        kb = []
-        for f in formats:
+        # Buttonlar: faqat 144/240/360/480/720 (mavjud bo‘lsa)
+        btns: List[InlineKeyboardButton] = []
+        for f in sorted(formats, key=lambda x: int(x.get("height") or 0), reverse=True):
             fmt_id = str(f.get("format_id"))
-            h = f.get("height")
-            size = human_mb(f.get("filesize") or f.get("filesize_approx"))
-            label = f"{size}, {h}p" if size else f"{h}p"
+            h = int(f.get("height") or 0)
+
+            total_bytes = _video_total_size_bytes(info, f)
+            size = human_mb_compact(total_bytes)
+            label = f"{h}p - {size}" if size else f"{h}p"
 
             token = _cache_put({
                 "url": url, "kind": "video", "format_id": fmt_id,
                 "origin_chat_id": origin_chat_id, "origin_message_id": origin_message_id,
                 "lang": lang,
             })
-            kb.append([InlineKeyboardButton(label, callback_data=f"dl|{token}")])
+            btns.append(InlineKeyboardButton(label, callback_data=f"dl|{token}"))
+
+        # 2-column layout (rasmdagidek)
+        kb: List[List[InlineKeyboardButton]] = []
+        for i in range(0, len(btns), 2):
+            kb.append(btns[i:i+2])
 
         token_a = _cache_put({
             "url": url, "kind": "audio", "format_id": None,
             "origin_chat_id": origin_chat_id, "origin_message_id": origin_message_id,
             "lang": lang,
         })
-        kb.append([InlineKeyboardButton(_t(lang, "btn_audio"), callback_data=f"dl|{token_a}")])
+        kb.append([InlineKeyboardButton("🎵 MP3", callback_data=f"dl|{token_a}")])
 
-        await context.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=message_id,
-            text=_t(lang, "yt_choose_fmt"),
-            reply_markup=InlineKeyboardMarkup(kb),
-        )
+        # Placeholder "formatlar olinmoqda" xabarini o‘chirib, oblojka (thumbnail) bilan yuboramiz
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except Exception:
+            pass
+
+        title_raw = (info.get("title") or "YouTube").strip()
+        # Caption limit uchun title’ni qisqartiramiz
+        if len(title_raw) > 200:
+            title_raw = title_raw[:197] + "..."
+        title = html.escape(title_raw)
+        dur = human_duration(info.get("duration"))
+
+        caption = _t(lang, "yt_caption", title=title, dur=dur)
+        thumb_url = _pick_best_thumbnail_url(info)
+
+        try:
+            if thumb_url:
+                await context.bot.send_photo(
+                    chat_id=origin_chat_id,
+                    photo=thumb_url,
+                    caption=caption,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup(kb),
+                    reply_to_message_id=origin_message_id,
+                )
+            else:
+                await context.bot.send_message(
+                    chat_id=origin_chat_id,
+                    text=caption,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup(kb),
+                    reply_to_message_id=origin_message_id,
+                )
+        except Exception:
+            # Thumbnail yuborilmasa ham — text bilan yuboramiz
+            await context.bot.send_message(
+                chat_id=origin_chat_id,
+                text=caption,
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup(kb),
+                reply_to_message_id=origin_message_id,
+            )
+
     except Exception as e:
         log.exception("Formatlarni olishda xato: %s", e)
         try:
@@ -967,6 +1149,7 @@ async def _task_show_youtube_formats(
             )
         except Exception:
             pass
+
 
 
 async def on_download_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -992,7 +1175,9 @@ async def on_download_button(update: Update, context: ContextTypes.DEFAULT_TYPE)
     payload = _cache_get(token)
     if not payload:
         try:
-            await q.edit_message_text(_t(lang, "btn_expired"))
+            # Eski tugma
+            if q.message:
+                await q.edit_message_text(_t(lang, "btn_expired"))
         except Exception:
             pass
         return
@@ -1006,8 +1191,17 @@ async def on_download_button(update: Update, context: ContextTypes.DEFAULT_TYPE)
     origin_message_id = payload.get("origin_message_id")
     reply_to_message_id = int(origin_message_id) if str(origin_message_id).isdigit() else None
 
+    # "⏳ ..." ogohlantirishni alohida yuboramiz va yuklab bo‘lganda o‘chirib tashlaymiz
+    status_chat_id: Optional[int] = None
+    status_message_id: Optional[int] = None
     try:
-        await q.edit_message_text(_t(lang, "downloading_wait"))
+        m = await context.bot.send_message(
+            chat_id=origin_chat_id,
+            text=_t(lang, "downloading_wait"),
+            reply_to_message_id=reply_to_message_id,
+        )
+        status_chat_id = m.chat_id
+        status_message_id = m.message_id
     except Exception:
         pass
 
@@ -1019,9 +1213,9 @@ async def on_download_button(update: Update, context: ContextTypes.DEFAULT_TYPE)
         kind=kind,
         format_id=format_id,
         lang=lang,
+        status_chat_id=status_chat_id,
+        status_message_id=status_message_id,
     ))
-
-
 async def _send_audio_with_retry(
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
@@ -1071,6 +1265,67 @@ async def _send_video_with_retry(
     if last_exc:
         raise last_exc
 
+async def _send_document_with_retry(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    path: Path,
+    caption: str,
+    reply_to_message_id: Optional[int],
+) -> None:
+    last_exc: Optional[Exception] = None
+    for _ in range(2):
+        try:
+            with open(path, "rb") as f:
+                await context.bot.send_document(
+                    chat_id=chat_id,
+                    document=f,
+                    caption=caption,
+                    reply_to_message_id=reply_to_message_id,
+                )
+            return
+        except TimedOut as e:
+            last_exc = e
+            await asyncio.sleep(2)
+    if last_exc:
+        raise last_exc
+
+
+def _download_tiktok_photos_zip(url: str, workdir: str) -> Path:
+    """Download TikTok /photo/ post images with gallery-dl and pack into ZIP."""
+    outdir = Path(workdir) / "tiktok_photos"
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    # gallery-dl CLI (pip orqali o‘rnatiladi). requirements.txt ga: gallery-dl
+    try:
+        subprocess.run(
+            ["gallery-dl", "-D", str(outdir), url],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+    except FileNotFoundError:
+        raise RuntimeError("gallery-dl topilmadi. requirements.txt ga 'gallery-dl' qo‘shing va redeploy qiling.")
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"gallery-dl xato: {e.stderr.strip()[:300] if e.stderr else e}")
+
+    imgs: List[Path] = []
+    for p in outdir.rglob("*"):
+        if p.is_file() and p.suffix.lower() in [".jpg", ".jpeg", ".png", ".webp"]:
+            imgs.append(p)
+
+    if not imgs:
+        raise RuntimeError("TikTok foto topilmadi (ehtimol captcha/blok).")
+
+    zip_path = Path(workdir) / "tiktok_photos.zip"
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        for p in sorted(imgs):
+            z.write(p, arcname=p.name)
+
+    return zip_path
+
+
+
 
 async def _task_download_and_send(
     context: ContextTypes.DEFAULT_TYPE,
@@ -1080,6 +1335,8 @@ async def _task_download_and_send(
     kind: str,
     format_id: Optional[str],
     lang: str,
+    status_chat_id: Optional[int] = None,
+    status_message_id: Optional[int] = None,
 ) -> None:
     loop = asyncio.get_running_loop()
     try:
@@ -1089,8 +1346,13 @@ async def _task_download_and_send(
             if kind == "audio":
                 path: Path = await loop.run_in_executor(None, _download_audio, url, td)
                 await _send_audio_with_retry(context, chat_id, path, caption, reply_to_message_id)
+
+            elif kind == "tt_photo":
+                path = await loop.run_in_executor(None, _download_tiktok_photos_zip, url, td)
+                await _send_document_with_retry(context, chat_id, path, caption, reply_to_message_id)
+
             else:
-                path: Path = await loop.run_in_executor(None, _download_video, url, format_id, td)
+                path = await loop.run_in_executor(None, _download_video, url, format_id, td)
                 await _send_video_with_retry(context, chat_id, path, caption, reply_to_message_id)
 
     except Exception as e:
@@ -1103,6 +1365,13 @@ async def _task_download_and_send(
             )
         except Exception:
             pass
+    finally:
+        # "⏳ ..." ogohlantirishini o‘chiramiz
+        if status_chat_id and status_message_id:
+            try:
+                await context.bot.delete_message(chat_id=status_chat_id, message_id=status_message_id)
+            except Exception:
+                pass
 
 
 # ---------------------------- App lifecycle ----------------------------
