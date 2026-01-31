@@ -1,5 +1,5 @@
 python-telegram-bot>=20.7
-yt-dlp
+yt-dlp>=2025.01.01
 asyncpg
 python-dotenv
 gallery-dl
