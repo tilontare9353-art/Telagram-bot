@@ -837,8 +837,18 @@ def _extract_info(url: str) -> Dict[str, Any]:
         raise
 
 def _select_youtube_formats(info: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Return a small curated list of YouTube video formats for buttons.
+
+    We show ONLY these labels (if available): 144/240/360/480/720.
+    Important: some videos have "almost" heights (e.g. 358 instead of 360),
+    so we pick the best format within a tolerance band below each target and
+    store the target label in f["_label_h"].
+    """
     formats = info.get("formats") or []
     vids = [f for f in formats if f.get("vcodec") != "none" and f.get("height")]
+
+    # group by height
     by_h: Dict[int, List[Dict[str, Any]]] = {}
     for f in vids:
         try:
@@ -847,29 +857,68 @@ def _select_youtube_formats(info: Dict[str, Any]) -> List[Dict[str, Any]]:
             continue
         by_h.setdefault(h, []).append(f)
 
-    desired_heights = [144, 240, 360, 480, 720]
-    picked: List[Dict[str, Any]] = []
+    desired = [144, 240, 360, 480, 720]
+    # allow slight deviations (some uploads are 358/478/etc.)
+    tol_map = {144: 40, 240: 50, 360: 60, 480: 80, 720: 140}
 
-    for h in desired_heights:
-        cand = by_h.get(h)
-        if not cand:
+    def score(x: Dict[str, Any]) -> Tuple[int, float, int]:
+        # prefer mp4, then higher bitrate, then known filesize
+        ext = (x.get("ext") or "").lower()
+        ext_score = 2 if ext == "mp4" else (1 if ext in ("mkv", "webm") else 0)
+        tbr = float(x.get("tbr") or 0.0)
+        fs = int(x.get("filesize") or x.get("filesize_approx") or 0)
+        return (ext_score, tbr, fs)
+
+    picked: List[Dict[str, Any]] = []
+    used_ids: set[str] = set()
+
+    all_heights = sorted(by_h.keys())
+
+    for target in desired:
+        tol = tol_map.get(target, 60)
+        lo = max(0, target - tol)
+        hi = target
+
+        # pick candidate heights within [lo, hi]
+        hs = [h for h in all_heights if lo <= h <= hi]
+        if not hs:
+            # as a fallback, pick the closest lower-or-equal height
+            hs = [h for h in all_heights if h <= target]
+        if not hs:
             continue
 
-        def score(x: Dict[str, Any]) -> Tuple[int, float, int]:
-            has_audio = 1 if x.get("acodec") != "none" else 0
-            tbr = float(x.get("tbr") or 0.0)
-            fs = int(x.get("filesize") or x.get("filesize_approx") or 0)
-            return (has_audio, tbr, fs)
-
+        # choose the height closest to target (prefer higher), then best score within that height
+        best_h = sorted(hs, key=lambda h: (h, -abs(target - h)), reverse=True)[0]
+        cand = by_h.get(best_h) or []
+        if not cand:
+            continue
         best = sorted(cand, key=score, reverse=True)[0]
+
+        fid = str(best.get("format_id") or "")
+        if not fid or fid in used_ids:
+            continue
+        used_ids.add(fid)
+
+        # store label height for UI
+        best["_label_h"] = target
         picked.append(best)
 
+    # absolute fallback: show up to 3 best formats up to 720p
     if not picked:
-        vids_sorted = sorted(vids, key=lambda x: float(x.get("tbr") or 0.0), reverse=True)
-        # Fallback: faqat 720p gacha ko‘rsatamiz (katta hajm bo‘lmasin)
-        vids_sorted = [v for v in vids_sorted if int(v.get("height") or 0) <= 720]
-        picked = vids_sorted[:5]
+        vids_sorted = sorted(
+            [v for v in vids if int(v.get("height") or 0) <= 720],
+            key=lambda x: float(x.get("tbr") or 0.0),
+            reverse=True,
+        )[:3]
+        for v in vids_sorted:
+            try:
+                v["_label_h"] = int(v.get("height") or 0)
+            except Exception:
+                v["_label_h"] = 0
+        picked = vids_sorted
+
     return picked
+
 
 def _download_video(url: str, format_id: Optional[str], workdir: str) -> Path:
     outtmpl = os.path.join(workdir, "%(id)s.%(ext)s")
@@ -1226,10 +1275,11 @@ async def _task_show_youtube_formats(
         for f in sorted(formats, key=lambda x: int(x.get("height") or 0), reverse=True):
             fmt_id = str(f.get("format_id"))
             h = int(f.get("height") or 0)
+            label_h = int(f.get("_label_h") or h)
 
             total_bytes = _video_total_size_bytes(info, f)
             size = human_mb_compact(total_bytes)
-            label = f"{h}p - {size}" if size else f"{h}p"
+            label = f"{label_h}p - {size}" if size else f"{label_h}p"
 
             token = _cache_put({
                 "url": url, "kind": "video", "format_id": fmt_id,
