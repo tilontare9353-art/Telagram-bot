@@ -52,7 +52,7 @@ import subprocess
 import zipfile
 import urllib.request
 import urllib.error
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlsplit, urlunsplit, urlparse
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
 
@@ -711,6 +711,38 @@ def _ensure_cookiefile(workdir: Optional[str] = None) -> Optional[str]:
         return None
 
 
+
+def _normalize_proxy(raw: str) -> Optional[str]:
+    """Validate and normalize proxy string from env.
+    Accepts: http(s)://user:pass@host:port , socks5://host:port , etc.
+    Returns normalized proxy URL or None if invalid.
+    """
+    if not raw:
+        return None
+    p = raw.strip()
+    if not p:
+        return None
+    # If scheme missing, assume http
+    if "://" not in p:
+        p = "http://" + p
+    try:
+        u = urlparse(p)
+        if u.scheme not in ("http", "https", "socks5", "socks5h"):
+            return None
+        # urlparse raises ValueError for bad port in py3.13 sometimes when accessing .port
+        host = u.hostname
+        if not host:
+            return None
+        try:
+            port = u.port
+        except Exception:
+            return None
+        if port is None:
+            return None
+    except Exception:
+        return None
+    return p
+
 def build_ydl_base(outtmpl: str, workdir: Optional[str] = None) -> Dict[str, Any]:
     opts = {
         "outtmpl": outtmpl,
@@ -766,9 +798,14 @@ def build_ydl_base(outtmpl: str, workdir: Optional[str] = None) -> Dict[str, Any
             # Agar kutubxona/target mos kelmasa, bot yiqilib qolmasligi uchun impersonate'ni o‘chirib yuboramiz.
             log.warning("Impersonate sozlamasi o‘chirildi (xato: %s). YTDLP_IMPERSONATE=%s", e, imp)
     # Proxy (ixtiyoriy): YTDLP_PROXY=http://user:pass@host:port
-    proxy = (os.getenv("YTDLP_PROXY") or "").strip()
+    proxy_raw = (os.getenv("YTDLP_PROXY") or "").strip()
+    proxy = _normalize_proxy(proxy_raw)
     if proxy:
         opts["proxy"] = proxy
+    elif proxy_raw:
+        # noto‘g‘ri proxy bo‘lsa, bot yiqilmasin — proxy’ni e'tiborsiz qoldiramiz
+        log.warning("YTDLP_PROXY noto‘g‘ri formatda, e'tiborsiz qoldirildi: %s", proxy_raw)
+
 
     # ffmpeg (merge/MP3 uchun) — Railway/Render'да PATH'da bo'lishi mumkin
     try:
