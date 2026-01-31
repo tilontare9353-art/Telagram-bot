@@ -181,6 +181,11 @@ TEXT = {
     "choose": {LANG_UZ: "Tanlang:", LANG_RU: "Выберите:"},
     "btn_video": {LANG_UZ: "📹 Video yuklab olish", LANG_RU: "📹 Скачать видео"},
     "btn_audio": {LANG_UZ: "🎵 Audio", LANG_RU: "🎵 Аудио"},
+    "btn_mp3": {LANG_UZ: "🎵 MP3", LANG_RU: "🎵 MP3"},
+    "tt_photo_audio_only": {
+        LANG_UZ: "Bu TikTok foto-post (/photo/). Faqat audio (MP3) yuklash mumkin:",
+        LANG_RU: "Это TikTok фото-пост (/photo/). Доступно только аудио (MP3):",
+    },
     "btn_tt_photo": {LANG_UZ: "🖼 Foto post (ZIP)", LANG_RU: "🖼 Фото-пост (ZIP)"},
     "tt_photo_only": {
         LANG_UZ: "Bu TikTok foto-post (/photo/). Rasmlarni ZIP ko‘rinishida yuklab oling:",
@@ -220,6 +225,11 @@ TEXT = {
         LANG_RU: "❌ YouTube требует подтверждение «я не бот». Cloud серверда YouTube учун ҳам керак:  cookies.txt, экспортированный из браузера (формат Netscape).",
     },
     
+    "yt_403": {
+        LANG_UZ: "❌ YouTube 403 Forbidden. Bu odatda cloud/datacenter IP blok ёки cookies eskirganidan bo‘ladi. Cookies.txt ni yangilang (login bo‘lgan brauzerdan eksport), yoki Proxy/VPS (rezident IP) ishlating.",
+        LANG_RU: "❌ YouTube 403 Forbidden. Обычно это блокировка cloud/datacenter IP или устаревшие cookies. Обновите cookies.txt (экспорт из залогиненного браузера) или используйте Proxy/VPS (резидентный IP).",
+    },
+
     "yt_botcheck_even_with_cookies": {
         LANG_UZ: "❌ YouTube «men robot emasman» tekshiruvini so‘radi. Cookies топилган бўлса ҳам cloud/IP блок сабабли baribir captcha chiqishi mumkin. Cookies.txt ni yangilang (login bo‘lgan brauzerdan), yoki VPS/Proxy (rezident IP) ishlating.",
         LANG_RU: "❌ YouTube просит подтверждение «я не бот». Ҳатто cookies билан ҳам cloud (datacenter IP) капча может появляться. Обновите cookies.txt (из залогиненного браузера) или используйте VPS/Proxy (резидентный IP).",
@@ -744,10 +754,17 @@ def build_ydl_base(outtmpl: str, workdir: Optional[str] = None) -> Dict[str, Any
     opts["http_headers"].setdefault("Accept-Language", "en-US,en;q=0.9")
     opts["http_headers"].setdefault("Referer", "https://www.youtube.com/")
 
-    # Impersonate (ixtiyoriy): YTDLP_IMPERSONATE=chrome|safari|...
+
+    # Impersonate (ixtiyoriy): YTDLP_IMPERSONATE=chrome|chrome-124:windows-10|safari|...
+    # Yangi yt-dlp (2026+) Python API'da opts["impersonate"] satri endi str emas, ImpersonateTarget bo‘lishi kerak.
     imp = (os.getenv("YTDLP_IMPERSONATE") or "").strip()
     if imp:
-        opts["impersonate"] = imp
+        try:
+            from yt_dlp.networking.impersonate import ImpersonateTarget  # type: ignore
+            opts["impersonate"] = ImpersonateTarget.from_str(imp.lower())
+        except Exception as e:
+            # Agar kutubxona/target mos kelmasa, bot yiqilib qolmasligi uchun impersonate'ni o‘chirib yuboramiz.
+            log.warning("Impersonate sozlamasi o‘chirildi (xato: %s). YTDLP_IMPERSONATE=%s", e, imp)
     # Proxy (ixtiyoriy): YTDLP_PROXY=http://user:pass@host:port
     proxy = (os.getenv("YTDLP_PROXY") or "").strip()
     if proxy:
