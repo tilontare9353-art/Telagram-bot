@@ -50,6 +50,9 @@ import base64
 import html
 import subprocess
 import zipfile
+import urllib.request
+import urllib.error
+from urllib.parse import urlsplit, urlunsplit
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
 
@@ -484,6 +487,31 @@ def is_tiktok_photo(url: str) -> bool:
     u = (url or "").lower()
     return ("tiktok.com" in u) and ("/photo/" in u)
 
+
+def _strip_query(url: str) -> str:
+    """Remove query params/fragments for more stable matching."""
+    try:
+        parts = urlsplit(url)
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+    except Exception:
+        return url
+
+
+def _resolve_final_url(url: str, timeout: float = 6.0) -> str:
+    """Follow redirects (useful for vt.tiktok.com short links)."""
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            final = getattr(resp, "geturl", lambda: url)()
+            return final or url
+    except Exception:
+        return url
+
 def _estimate_bytes_from_kbps(kbps: Optional[float], duration_s: Optional[float]) -> int:
     if not kbps or not duration_s or kbps <= 0 or duration_s <= 0:
         return 0
@@ -561,6 +589,10 @@ def _friendly_ydl_error(e: Exception, lang: str) -> str:
         if (os.getenv("YT_COOKIES_B64") or os.getenv("YT_COOKIES_FILE")):
             return _t(lang, "yt_botcheck_even_with_cookies")
         return _t(lang, "yt_need_cookies")
+
+    # 403 Forbidden (ko‘pincha YouTube cloud/IP blok)
+    if "http error 403" in s_low or "403 forbidden" in s_low:
+        return _t(lang, "yt_403")
 
     if "unsupported url" in s_low:
         return s
@@ -693,16 +725,29 @@ def build_ydl_base(outtmpl: str, workdir: Optional[str] = None) -> Dict[str, Any
     if cookiefile:
         opts["cookiefile"] = cookiefile
 
-    # YouTube extractor: ba'zan android client yumshoqroq ishlaydi
+    # YouTube extractor: ba'zan mobile client yumshoqroq ishlaydi
     opts.setdefault("extractor_args", {})
     opts["extractor_args"].setdefault("youtube", {})
-    opts["extractor_args"]["youtube"].setdefault("player_client", ["android", "web"])
+    opts["extractor_args"]["youtube"].setdefault("player_client", ["android", "ios", "web"])
 
-    # User-Agent (ixtiyoriy)
+    # HTTP headers (User-Agent / Accept-Language)
+    opts.setdefault("http_headers", {})
     ua = (os.getenv("YTDLP_UA") or "").strip()
     if ua:
-        opts.setdefault("http_headers", {})
         opts["http_headers"]["User-Agent"] = ua
+    else:
+        # default browser UA
+        opts["http_headers"].setdefault(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        )
+    opts["http_headers"].setdefault("Accept-Language", "en-US,en;q=0.9")
+    opts["http_headers"].setdefault("Referer", "https://www.youtube.com/")
+
+    # Impersonate (ixtiyoriy): YTDLP_IMPERSONATE=chrome|safari|...
+    imp = (os.getenv("YTDLP_IMPERSONATE") or "").strip()
+    if imp:
+        opts["impersonate"] = imp
     # Proxy (ixtiyoriy): YTDLP_PROXY=http://user:pass@host:port
     proxy = (os.getenv("YTDLP_PROXY") or "").strip()
     if proxy:
@@ -719,13 +764,13 @@ def build_ydl_base(outtmpl: str, workdir: Optional[str] = None) -> Dict[str, Any
     return opts
 
 def _extract_info(url: str) -> Dict[str, Any]:
-    # Formatlarni ko‘rsatish uchun "process=False" ishlatamiz:
-    # bu format tanlash (format selection) bosqichini chetlab o‘tadi va
-    # "Requested format is not available" xatosini ko‘p holatda yo‘q qiladi.
+    # Formatlarni ko‘rsatish uchun to‘liq "process=True" kerak bo‘ladi,
+    # aks holda ba'zan faqat audio ko‘rinib qoladi.
     ydl_opts = build_ydl_base(outtmpl="%(title)s.%(ext)s", workdir=tempfile.gettempdir())
     ydl_opts["ignore_no_formats_error"] = True
+    ydl_opts["skip_download"] = True
     with YoutubeDL(ydl_opts) as ydl:
-        return ydl.extract_info(url, download=False, process=False)
+        return ydl.extract_info(url, download=False)
 
 def _select_youtube_formats(info: Dict[str, Any]) -> List[Dict[str, Any]]:
     formats = info.get("formats") or []
@@ -757,7 +802,9 @@ def _select_youtube_formats(info: Dict[str, Any]) -> List[Dict[str, Any]]:
 
     if not picked:
         vids_sorted = sorted(vids, key=lambda x: float(x.get("tbr") or 0.0), reverse=True)
-        picked = vids_sorted[:6]
+        # Fallback: faqat 720p gacha ko‘rsatamiz (katta hajm bo‘lmasin)
+        vids_sorted = [v for v in vids_sorted if int(v.get("height") or 0) <= 720]
+        picked = vids_sorted[:5]
     return picked
 
 def _download_video(url: str, format_id: Optional[str], workdir: str) -> Path:
@@ -1006,6 +1053,16 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not url:
         return
 
+    # TikTok short links (vt.tiktok.com/...) ni to‘liq URL ga yechib olamiz,
+    # shunda /photo/ postlarni to‘g‘ri aniqlash mumkin.
+    url_eff = url
+    if is_tiktok(url):
+        u_low = url.lower()
+        if any(x in u_low for x in ("vt.tiktok.com", "vm.tiktok.com", "tiktok.com/t/")):
+            loop = asyncio.get_running_loop()
+            url_eff = await loop.run_in_executor(None, _resolve_final_url, url)
+        url_eff = _strip_query(url_eff)
+
     lang = await get_user_lang(update, context)
 
     origin_chat_id = update.message.chat_id
@@ -1025,25 +1082,27 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
         )
     else:
-        # TikTok photo-post (/photo/) — video emas, rasmlar bo‘ladi
-        if is_tiktok_photo(url):
+        # TikTok photo-post (/photo/) — bu turda faqat audio (MP3) taklif qilamiz
+        if is_tiktok_photo(url_eff):
             token_p = _cache_put({
-                "url": url, "kind": "tt_photo", "format_id": None,
+                "url": url_eff, "kind": "tt_photo_audio", "format_id": None,
                 "origin_chat_id": origin_chat_id, "origin_message_id": origin_message_id,
                 "lang": lang,
             })
-            kb = [[InlineKeyboardButton(_t(lang, "btn_tt_photo"), callback_data=f"dl|{token_p}")]]
-            await update.message.reply_text(_t(lang, "tt_photo_only"), reply_markup=InlineKeyboardMarkup(kb))
+            kb = [[InlineKeyboardButton(_t(lang, "btn_mp3"), callback_data=f"dl|{token_p}")]]
+            await update.message.reply_text(_t(lang, "tt_photo_audio_only"), reply_markup=InlineKeyboardMarkup(kb))
             return
+
+        url_for_dl = url_eff if is_tiktok(url) else url
 
         kb = []
         t_v = _cache_put({
-            "url": url, "kind": "video", "format_id": None,
+            "url": url_for_dl, "kind": "video", "format_id": None,
             "origin_chat_id": origin_chat_id, "origin_message_id": origin_message_id,
             "lang": lang,
         })
         t_a = _cache_put({
-            "url": url, "kind": "audio", "format_id": None,
+            "url": url_for_dl, "kind": "audio", "format_id": None,
             "origin_chat_id": origin_chat_id, "origin_message_id": origin_message_id,
             "lang": lang,
         })
@@ -1181,6 +1240,13 @@ async def on_download_button(update: Update, context: ContextTypes.DEFAULT_TYPE)
         except Exception:
             pass
         return
+
+    # Payload topildi — endi format menyusini (tugmalar) xabarini avtomat o‘chirib yuboramiz
+    try:
+        if q.message is not None:
+            await context.bot.delete_message(chat_id=q.message.chat_id, message_id=q.message.message_id)
+    except Exception:
+        pass
 
     url = payload["url"]
     kind = payload["kind"]
@@ -1325,6 +1391,88 @@ def _download_tiktok_photos_zip(url: str, workdir: str) -> Path:
     return zip_path
 
 
+def _download_tiktok_photo_audio(url: str, workdir: str) -> Path:
+    """Best-effort: TikTok /photo/ postdan audio (MP3) chiqarib beradi.
+
+    1) /photo/ID -> /video/ID ko‘rinishiga aylantirib yt-dlp orqali audio
+    2) Agar bo‘lmasa, gallery-dl orqali medialarni tushirib, eng katta mp4/m4a dan audio ajratadi.
+    """
+    clean = _strip_query(url)
+    # 1) Urinib ko‘ramiz: /photo/<id> -> /video/<id>
+    video_variant = re.sub(r"/photo/([0-9]+)/?$", r"/video/\1", clean)
+
+    try:
+        return _download_audio(video_variant, workdir)
+    except Exception as e1:
+        # ba'zi hollarda original URL ham ishlashi mumkin
+        try:
+            return _download_audio(clean, workdir)
+        except Exception:
+            pass
+
+        # 2) Fallback: gallery-dl
+        outdir = Path(workdir) / "tiktok_media"
+        outdir.mkdir(parents=True, exist_ok=True)
+        try:
+            subprocess.run(
+                ["gallery-dl", "-D", str(outdir), clean],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+        except FileNotFoundError:
+            # e1 ni yo‘qotmaslik uchun kerakli hint beramiz
+            raise RuntimeError(
+                "TikTok foto-post audio uchun 'gallery-dl' kerak. requirements.txt ga 'gallery-dl' qo‘shing va redeploy qiling. "
+                f"Asl xato: {str(e1)[:200]}"
+            )
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(f"gallery-dl xato: {e.stderr.strip()[:300] if e.stderr else e}")
+
+        candidates: List[Path] = []
+        for p in outdir.rglob("*"):
+            if not p.is_file():
+                continue
+            if p.suffix.lower() in [".m4a", ".mp3", ".aac", ".ogg", ".webm", ".mp4"]:
+                candidates.append(p)
+
+        if not candidates:
+            raise RuntimeError("TikTok media topilmadi (ehtimol captcha/blok).")
+
+        src = max(candidates, key=lambda p: p.stat().st_size)
+        if src.suffix.lower() in [".mp3", ".m4a", ".aac", ".ogg"]:
+            return src
+
+        # mp4/webm bo‘lsa, audio ajratamiz
+        out_mp3 = Path(workdir) / "tiktok_audio.mp3"
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            # ffmpeg yo‘q bo‘lsa, bor formatni qaytaramiz (Telegram audio sifatida ham yuboriladi)
+            return src
+
+        try:
+            subprocess.run(
+                [ffmpeg, "-y", "-i", str(src), "-vn", "-acodec", "libmp3lame", "-b:a", "192k", str(out_mp3)],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+            return out_mp3
+        except subprocess.CalledProcessError:
+            # oxirgi urinish: audio streamni copy qilib ko‘ramiz
+            out_m4a = Path(workdir) / "tiktok_audio.m4a"
+            subprocess.run(
+                [ffmpeg, "-y", "-i", str(src), "-vn", "-c:a", "copy", str(out_m4a)],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+            return out_m4a
+
+
 
 
 async def _task_download_and_send(
@@ -1347,9 +1495,9 @@ async def _task_download_and_send(
                 path: Path = await loop.run_in_executor(None, _download_audio, url, td)
                 await _send_audio_with_retry(context, chat_id, path, caption, reply_to_message_id)
 
-            elif kind == "tt_photo":
-                path = await loop.run_in_executor(None, _download_tiktok_photos_zip, url, td)
-                await _send_document_with_retry(context, chat_id, path, caption, reply_to_message_id)
+            elif kind == "tt_photo_audio":
+                path = await loop.run_in_executor(None, _download_tiktok_photo_audio, url, td)
+                await _send_audio_with_retry(context, chat_id, path, caption, reply_to_message_id)
 
             else:
                 path = await loop.run_in_executor(None, _download_video, url, format_id, td)
