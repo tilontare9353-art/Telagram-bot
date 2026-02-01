@@ -743,6 +743,35 @@ def _normalize_proxy(raw: str) -> Optional[str]:
         return None
     return p
 
+def _parse_js_runtimes_env(value: str) -> Dict[str, Dict[str, Any]]:
+    """Parse YTDLP_JS_RUNTIME env into yt-dlp Python API format.
+
+    yt-dlp (2026+) expects: dict of {runtime: {config}}
+    Examples:
+      - "deno" -> {"deno": {}}
+      - "node" -> {"node": {}}
+      - "node:/usr/bin/node" -> {"node": {"path": "/usr/bin/node"}}
+      - "deno,node" -> {"deno": {}, "node": {}}
+    """
+    v = (value or "").strip()
+    if not v:
+        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for part in [p.strip() for p in v.split(",") if p.strip()]:
+        if ":" in part:
+            rt, pth = part.split(":", 1)
+            rt = rt.strip()
+            pth = pth.strip()
+            if rt:
+                cfg: Dict[str, Any] = {}
+                if pth:
+                    cfg["path"] = pth
+                out[rt] = cfg
+        else:
+            out[part] = {}
+    return out
+
+
 def build_ydl_base(outtmpl: str, workdir: Optional[str] = None) -> Dict[str, Any]:
     opts = {
         "outtmpl": outtmpl,
@@ -819,13 +848,13 @@ def build_ydl_base(outtmpl: str, workdir: Optional[str] = None) -> Dict[str, Any
     try:
         js_runtime_env = (os.getenv("YTDLP_JS_RUNTIME") or "").strip().lower()
         if js_runtime_env:
-            opts["js_runtimes"] = [js_runtime_env]  # masalan: deno yoki node
+            opts["js_runtimes"] = _parse_js_runtimes_env(js_runtime_env)
         else:
             # avtomatik: avval deno, bo‘lmasa node
             if shutil.which("deno"):
-                opts["js_runtimes"] = ["deno"]
+                opts["js_runtimes"] = {"deno": {}}
             elif shutil.which("node"):
-                opts["js_runtimes"] = ["node"]
+                opts["js_runtimes"] = {"node": {}}
 
         # Remote EJS komponentlarini (github) yuklashga ruxsat: kerak bo‘lsa challenge-solver skriptlarini oladi.
         # Istasangiz env bilan o‘chirib qo‘yasiz: YTDLP_REMOTE_EJS=0
