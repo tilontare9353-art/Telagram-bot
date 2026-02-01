@@ -890,6 +890,15 @@ def _select_youtube_formats(info: Dict[str, Any]) -> List[Dict[str, Any]]:
     formats = info.get("formats") or []
     vids = [f for f in formats if f.get("vcodec") != "none" and f.get("height")]
 
+    ff_ok = bool(shutil.which("ffmpeg"))
+
+    def _has_audio(cands: List[Dict[str, Any]]) -> bool:
+        for c in cands:
+            ac = (c.get("acodec") or "none")
+            if ac and ac != "none":
+                return True
+        return False
+
     # group by height
     by_h: Dict[int, List[Dict[str, Any]]] = {}
     for f in vids:
@@ -929,6 +938,14 @@ def _select_youtube_formats(info: Dict[str, Any]) -> List[Dict[str, Any]]:
         if not hs:
             continue
 
+        # If ffmpeg is NOT available, we should prefer only progressive formats (with audio).
+        if not ff_ok:
+            hs_audio = [h for h in hs if _has_audio(by_h.get(h) or [])]
+            if not hs_audio:
+                # nothing playable with audio for this target
+                continue
+            hs = hs_audio
+
         # choose the height closest to target (prefer higher), then best score within that height
         best_h = sorted(hs, key=lambda h: (h, -abs(target - h)), reverse=True)[0]
         cand = by_h.get(best_h) or []
@@ -962,7 +979,7 @@ def _select_youtube_formats(info: Dict[str, Any]) -> List[Dict[str, Any]]:
     return picked
 
 
-def _download_video(url: str, format_id: Optional[str], workdir: str) -> Path:
+def _download_video(url: str, format_id: Optional[str], workdir: str, label_h: Optional[int] = None) -> Path:
     outtmpl = os.path.join(workdir, "%(id)s.%(ext)s")
 
     def _run_with_opts(opts: Dict[str, Any]) -> Path:
@@ -1050,7 +1067,13 @@ def _download_video(url: str, format_id: Optional[str], workdir: str) -> Path:
             if ff_ok:
                 ydl_opts["format"] = f"b[format_id={fid}]/bv[format_id={fid}]+ba/best"
             else:
-                ydl_opts["format"] = f"b[format_id={fid}]/b/best"
+                # No ffmpeg: avoid video-only itags that would require merging.
+                # If we know the UI label height, use it as a safe cap to pick a progressive (A/V) format.
+                if label_h and int(label_h) > 0:
+                    hmax = int(label_h)
+                    ydl_opts["format"] = f"b[height<={hmax}][ext=mp4]/b[height<={hmax}]/best[height<={hmax}]/best"
+                else:
+                    ydl_opts["format"] = "b[ext=mp4]/b/best"
             ydl_opts["merge_output_format"] = "mp4"
     else:
         ydl_opts["format"] = "bv*+ba/b" if ff_ok else "b/best"
@@ -1365,7 +1388,7 @@ async def _task_show_youtube_formats(
             label = f"{label_h}p - {size}" if size else f"{label_h}p"
 
             token = _cache_put({
-                "url": url, "kind": "video", "format_id": fmt_id,
+                "url": url, "kind": "video", "format_id": fmt_id, "label_h": label_h,
                 "origin_chat_id": origin_chat_id, "origin_message_id": origin_message_id,
                 "lang": lang,
             })
@@ -1480,6 +1503,7 @@ async def on_download_button(update: Update, context: ContextTypes.DEFAULT_TYPE)
     url = payload["url"]
     kind = payload["kind"]
     format_id = payload.get("format_id")
+    label_h = payload.get("label_h")
     lang = payload.get("lang") or lang
 
     origin_chat_id = int(payload.get("origin_chat_id") or (q.message.chat_id if q.message else update.effective_chat.id))
@@ -1507,6 +1531,7 @@ async def on_download_button(update: Update, context: ContextTypes.DEFAULT_TYPE)
         url=url,
         kind=kind,
         format_id=format_id,
+        label_h=label_h,
         lang=lang,
         status_chat_id=status_chat_id,
         status_message_id=status_message_id,
@@ -1711,7 +1736,8 @@ async def _task_download_and_send(
     url: str,
     kind: str,
     format_id: Optional[str],
-    lang: str,
+lang: str,
+    label_h: Optional[int] = None,
     status_chat_id: Optional[int] = None,
     status_message_id: Optional[int] = None,
 ) -> None:
@@ -1729,7 +1755,7 @@ async def _task_download_and_send(
                 await _send_audio_with_retry(context, chat_id, path, caption, reply_to_message_id)
 
             else:
-                path = await loop.run_in_executor(None, _download_video, url, format_id, td)
+                path = await loop.run_in_executor(None, _download_video, url, format_id, td, label_h)
                 await _send_video_with_retry(context, chat_id, path, caption, reply_to_message_id)
 
     except Exception as e:
