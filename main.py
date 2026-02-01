@@ -1054,11 +1054,24 @@ def _download_video(url: str, format_id: Optional[str], workdir: str) -> Path:
             ydl_opts["merge_output_format"] = "mp4"
         else:
             # Exact itag / format_id
-            fid = str(format_id)
-            # Exact itag: first try progressive (audio+video) if available (e.g. 18),
-            # else merge video-only with best audio (ffmpeg needed), finally fallback to best.
-            ydl_opts["format"] = f"b[format_id={fid}]/bv[format_id={fid}]+ba/best"
+            fid = str(format_id).strip()
+            # Eng ishonchli yo‘l: itag'ni to‘g‘ridan-to‘g‘ri beramiz.
+            # Agar tanlangan format audio'ni o‘z ichiga olsa (progressive) — faqat o‘sha itag yetarli.
+            # Agar video-only bo‘lsa — bestaudio qo‘shib merge qilamiz (ffmpeg kerak).
+            if fid.isdigit():
+                if has_audio is True:
+                    ydl_opts["format"] = fid
+                elif has_audio is False:
+                    ydl_opts["format"] = f"{fid}+bestaudio/best"
+                else:
+                    # ma'lumot kelmasa, ikkala variantni ham sinab ko‘ramiz
+                    ydl_opts["format"] = f"{fid}+bestaudio/{fid}/best"
+            else:
+                # noodatiy format_id bo‘lsa (masalan h:480 bo‘lib qolsa), bestvideo/bestaudio'ga qaytamiz
+                ydl_opts["format"] = "bestvideo+bestaudio/best"
             ydl_opts["merge_output_format"] = "mp4"
+
+
     else:
         ydl_opts["format"] = "bv*+ba/best"
         ydl_opts["merge_output_format"] = "mp4"
