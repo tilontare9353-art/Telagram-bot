@@ -533,8 +533,7 @@ def _best_audio_size_bytes(info: Dict[str, Any]) -> int:
     dur = info.get("duration")
     auds = [f for f in formats if f.get("vcodec") == "none" and f.get("acodec") != "none"]
     if not auds:
-        # fallback: assume ~128 kbps audio if duration is known
-        return _estimate_bytes_from_kbps(128.0, dur)
+        return 0
 
     def score(a: Dict[str, Any]) -> Tuple[float, int]:
         abr = float(a.get("abr") or 0.0)
@@ -548,53 +547,19 @@ def _best_audio_size_bytes(info: Dict[str, Any]) -> int:
     sz = int(best.get("filesize") or best.get("filesize_approx") or 0)
     if sz > 0:
         return sz
-
     kbps = float(best.get("tbr") or best.get("abr") or 0.0)
-    est = _estimate_bytes_from_kbps(kbps, dur)
-    if est > 0:
-        return est
-
-    # last fallback: assume ~128 kbps audio if nothing else is available
-    return _estimate_bytes_from_kbps(128.0, dur)
-
-
-def _fallback_video_kbps(height: int) -> float:
-    """Heuristic bitrate (kbps) to estimate size when yt-dlp doesn't provide filesize/tbr."""
-    h = int(height or 0)
-    if h <= 144:
-        return 250.0
-    if h <= 240:
-        return 400.0
-    if h <= 360:
-        return 800.0
-    if h <= 480:
-        return 1200.0
-    if h <= 720:
-        return 2500.0
-    if h <= 1080:
-        return 4500.0
-    return 6500.0
-
+    return _estimate_bytes_from_kbps(kbps, dur)
 
 def _video_total_size_bytes(info: Dict[str, Any], f: Dict[str, Any]) -> int:
     dur = info.get("duration")
-
     sz = int(f.get("filesize") or f.get("filesize_approx") or 0)
     if sz <= 0:
         kbps = float(f.get("tbr") or 0.0)
-        if kbps <= 0:
-            # pseudo formats (h:360) and some YouTube entries can miss tbr/filesize;
-            # estimate from resolution heuristics so button labels show sizes.
-            h = int(f.get("_label_h") or f.get("height") or 0)
-            kbps = _fallback_video_kbps(h)
         sz = _estimate_bytes_from_kbps(kbps, dur)
-
     # If this format has no audio, add best audio size for display
     if (f.get("acodec") == "none") or not f.get("acodec"):
         sz += _best_audio_size_bytes(info)
-
     return sz
-
 
 def _pick_best_thumbnail_url(info: Dict[str, Any]) -> Optional[str]:
     # yt-dlp may provide 'thumbnail' and list 'thumbnails'
@@ -848,7 +813,34 @@ def build_ydl_base(outtmpl: str, workdir: Optional[str] = None) -> Dict[str, Any
         if ff:
             opts['ffmpeg_location'] = ff
     except Exception:
+        pass    # --- YouTube EJS / JS-challenge (formatlar yo‘qolib qolmasligi uchun) ---
+    # Ba'zi videolarda YouTube "bot-check" qilib, JS-challenge yechilmasa faqat storyboard (rasmlar) qolib ketadi.
+    # Buni yechish uchun JS runtime (deno yoki node) va (kerak bo‘lsa) EJS remote component ruxsati kerak bo‘ladi.
+    try:
+        js_runtime_env = (os.getenv("YTDLP_JS_RUNTIME") or "").strip().lower()
+        if js_runtime_env:
+            opts["js_runtimes"] = [js_runtime_env]  # masalan: deno yoki node
+        else:
+            # avtomatik: avval deno, bo‘lmasa node
+            if shutil.which("deno"):
+                opts["js_runtimes"] = ["deno"]
+            elif shutil.which("node"):
+                opts["js_runtimes"] = ["node"]
+
+        # Remote EJS komponentlarini (github) yuklashga ruxsat: kerak bo‘lsa challenge-solver skriptlarini oladi.
+        # Istasangiz env bilan o‘chirib qo‘yasiz: YTDLP_REMOTE_EJS=0
+        if os.getenv("YTDLP_REMOTE_EJS", "1") == "1":
+            rc = opts.get("remote_components")
+            if rc is None:
+                rc = []
+            if isinstance(rc, str):
+                rc = [rc]
+            if "ejs:github" not in rc:
+                rc.append("ejs:github")
+            opts["remote_components"] = rc
+    except Exception:
         pass
+
 
     return opts
 
@@ -1033,7 +1025,10 @@ def _download_video(url: str, format_id: Optional[str], workdir: str) -> Path:
             ydl_opts["merge_output_format"] = "mp4"
         else:
             # Exact itag / format_id
-            ydl_opts["format"] = f"{format_id}+bestaudio/{format_id}/best"
+            fid = str(format_id)
+            # Exact itag: first try progressive (audio+video) if available (e.g. 18),
+            # else merge video-only with best audio (ffmpeg needed), finally fallback to best.
+            ydl_opts["format"] = f"b[format_id={fid}]/bv[format_id={fid}]+ba/best"
             ydl_opts["merge_output_format"] = "mp4"
     else:
         ydl_opts["format"] = "bv*+ba/best"
