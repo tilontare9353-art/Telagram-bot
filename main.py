@@ -533,8 +533,7 @@ def _best_audio_size_bytes(info: Dict[str, Any]) -> int:
     dur = info.get("duration")
     auds = [f for f in formats if f.get("vcodec") == "none" and f.get("acodec") != "none"]
     if not auds:
-        # fallback: assume ~128 kbps audio if duration is known
-        return _estimate_bytes_from_kbps(128.0, dur)
+        return 0
 
     def score(a: Dict[str, Any]) -> Tuple[float, int]:
         abr = float(a.get("abr") or 0.0)
@@ -548,53 +547,19 @@ def _best_audio_size_bytes(info: Dict[str, Any]) -> int:
     sz = int(best.get("filesize") or best.get("filesize_approx") or 0)
     if sz > 0:
         return sz
-
     kbps = float(best.get("tbr") or best.get("abr") or 0.0)
-    est = _estimate_bytes_from_kbps(kbps, dur)
-    if est > 0:
-        return est
-
-    # last fallback: assume ~128 kbps audio if nothing else is available
-    return _estimate_bytes_from_kbps(128.0, dur)
-
-
-def _fallback_video_kbps(height: int) -> float:
-    """Heuristic bitrate (kbps) to estimate size when yt-dlp doesn't provide filesize/tbr."""
-    h = int(height or 0)
-    if h <= 144:
-        return 250.0
-    if h <= 240:
-        return 400.0
-    if h <= 360:
-        return 800.0
-    if h <= 480:
-        return 1200.0
-    if h <= 720:
-        return 2500.0
-    if h <= 1080:
-        return 4500.0
-    return 6500.0
-
+    return _estimate_bytes_from_kbps(kbps, dur)
 
 def _video_total_size_bytes(info: Dict[str, Any], f: Dict[str, Any]) -> int:
     dur = info.get("duration")
-
     sz = int(f.get("filesize") or f.get("filesize_approx") or 0)
     if sz <= 0:
         kbps = float(f.get("tbr") or 0.0)
-        if kbps <= 0:
-            # pseudo formats (h:360) and some YouTube entries can miss tbr/filesize;
-            # estimate from resolution heuristics so button labels show sizes.
-            h = int(f.get("_label_h") or f.get("height") or 0)
-            kbps = _fallback_video_kbps(h)
         sz = _estimate_bytes_from_kbps(kbps, dur)
-
     # If this format has no audio, add best audio size for display
     if (f.get("acodec") == "none") or not f.get("acodec"):
         sz += _best_audio_size_bytes(info)
-
     return sz
-
 
 def _pick_best_thumbnail_url(info: Dict[str, Any]) -> Optional[str]:
     # yt-dlp may provide 'thumbnail' and list 'thumbnails'
@@ -890,15 +855,6 @@ def _select_youtube_formats(info: Dict[str, Any]) -> List[Dict[str, Any]]:
     formats = info.get("formats") or []
     vids = [f for f in formats if f.get("vcodec") != "none" and f.get("height")]
 
-    ff_ok = bool(shutil.which("ffmpeg"))
-
-    def _has_audio(cands: List[Dict[str, Any]]) -> bool:
-        for c in cands:
-            ac = (c.get("acodec") or "none")
-            if ac and ac != "none":
-                return True
-        return False
-
     # group by height
     by_h: Dict[int, List[Dict[str, Any]]] = {}
     for f in vids:
@@ -938,14 +894,6 @@ def _select_youtube_formats(info: Dict[str, Any]) -> List[Dict[str, Any]]:
         if not hs:
             continue
 
-        # If ffmpeg is NOT available, we should prefer only progressive formats (with audio).
-        if not ff_ok:
-            hs_audio = [h for h in hs if _has_audio(by_h.get(h) or [])]
-            if not hs_audio:
-                # nothing playable with audio for this target
-                continue
-            hs = hs_audio
-
         # choose the height closest to target (prefer higher), then best score within that height
         best_h = sorted(hs, key=lambda h: (h, -abs(target - h)), reverse=True)[0]
         cand = by_h.get(best_h) or []
@@ -979,7 +927,7 @@ def _select_youtube_formats(info: Dict[str, Any]) -> List[Dict[str, Any]]:
     return picked
 
 
-def _download_video(url: str, format_id: Optional[str], workdir: str, label_h: Optional[int] = None) -> Path:
+def _download_video(url: str, format_id: Optional[str], workdir: str) -> Path:
     outtmpl = os.path.join(workdir, "%(id)s.%(ext)s")
 
     def _run_with_opts(opts: Dict[str, Any]) -> Path:
@@ -1034,12 +982,6 @@ def _download_video(url: str, format_id: Optional[str], workdir: str, label_h: O
 
     ydl_opts = build_ydl_base(outtmpl=outtmpl, workdir=workdir)
 
-    # NOTE: Some YouTube formats already include audio+video (progressive). In that case,
-    # requesting "<itag>+bestaudio" can fail with "Requested format is not available".
-    # We therefore prefer the exact combined format first, then fall back to merging (if ffmpeg exists),
-    # and finally to a generic "best" selector.
-    ff_ok = bool(ydl_opts.get("ffmpeg_location")) or bool(shutil.which("ffmpeg"))
-
     if format_id:
         # Special pseudo format: "h:720" means request max height <= 720
         if isinstance(format_id, str) and format_id.lower().startswith("h:"):
@@ -1047,44 +989,30 @@ def _download_video(url: str, format_id: Optional[str], workdir: str, label_h: O
                 hmax = int(format_id.split(":", 1)[1])
             except Exception:
                 hmax = 360
-
-            if ff_ok:
-                # Try progressive first (no merge needed), then mergeable streams, then best within cap
-                ydl_opts["format"] = (
-                    f"b[height<={hmax}][ext=mp4]/b[height<={hmax}]/"
-                    f"bv*[height<={hmax}][ext=mp4]+ba[ext=m4a]/"
-                    f"bv*[height<={hmax}]+ba/"
-                    f"best[height<={hmax}]/best"
-                )
-            else:
-                # No ffmpeg: avoid requiring merges
-                ydl_opts["format"] = f"b[height<={hmax}][ext=mp4]/b[height<={hmax}]/best[height<={hmax}]/best"
-
+            # Prefer mp4 video + m4a audio, fallback to best within height cap
+            ydl_opts["format"] = (
+                f"bv*[height<={hmax}][ext=mp4]+ba[ext=m4a]/"
+                f"bv*[height<={hmax}]+ba/"
+                f"b[height<={hmax}][ext=mp4]/b[height<={hmax}]/best"
+            )
             ydl_opts["merge_output_format"] = "mp4"
         else:
-            # Exact itag / format_id (prefer the exact progressive format first)
-            fid = str(format_id)
-            if ff_ok:
-                ydl_opts["format"] = f"b[format_id={fid}]/bv[format_id={fid}]+ba/best"
-            else:
-                # No ffmpeg: avoid video-only itags that would require merging.
-                # If we know the UI label height, use it as a safe cap to pick a progressive (A/V) format.
-                if label_h and int(label_h) > 0:
-                    hmax = int(label_h)
-                    ydl_opts["format"] = f"b[height<={hmax}][ext=mp4]/b[height<={hmax}]/best[height<={hmax}]/best"
-                else:
-                    ydl_opts["format"] = "b[ext=mp4]/b/best"
+            # Exact itag / format_id
+            ydl_opts["format"] = (
+                f"b[format_id={format_id}]/"
+                f"bv[format_id={format_id}]+ba/"
+                f"best"
+            )
             ydl_opts["merge_output_format"] = "mp4"
     else:
-        ydl_opts["format"] = "bv*+ba/b" if ff_ok else "b/best"
+        ydl_opts["format"] = "bv*+ba/best"
         ydl_opts["merge_output_format"] = "mp4"
 
     try:
         return _run_with_opts(ydl_opts)
     except Exception:
         ydl_opts_fallback = dict(ydl_opts)
-        # Ultra-safe fallback: prefer progressive (no merge), then any best.
-        ydl_opts_fallback["format"] = "b[ext=mp4]/b/best" if ff_ok else "b/best"
+        ydl_opts_fallback["format"] = "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/best"
         ydl_opts_fallback["merge_output_format"] = "mp4"
         return _run_with_opts(ydl_opts_fallback)
 
@@ -1388,7 +1316,7 @@ async def _task_show_youtube_formats(
             label = f"{label_h}p - {size}" if size else f"{label_h}p"
 
             token = _cache_put({
-                "url": url, "kind": "video", "format_id": fmt_id, "label_h": label_h,
+                "url": url, "kind": "video", "format_id": fmt_id,
                 "origin_chat_id": origin_chat_id, "origin_message_id": origin_message_id,
                 "lang": lang,
             })
@@ -1503,7 +1431,6 @@ async def on_download_button(update: Update, context: ContextTypes.DEFAULT_TYPE)
     url = payload["url"]
     kind = payload["kind"]
     format_id = payload.get("format_id")
-    label_h = payload.get("label_h")
     lang = payload.get("lang") or lang
 
     origin_chat_id = int(payload.get("origin_chat_id") or (q.message.chat_id if q.message else update.effective_chat.id))
@@ -1531,7 +1458,6 @@ async def on_download_button(update: Update, context: ContextTypes.DEFAULT_TYPE)
         url=url,
         kind=kind,
         format_id=format_id,
-        label_h=label_h,
         lang=lang,
         status_chat_id=status_chat_id,
         status_message_id=status_message_id,
@@ -1736,8 +1662,7 @@ async def _task_download_and_send(
     url: str,
     kind: str,
     format_id: Optional[str],
-lang: str,
-    label_h: Optional[int] = None,
+    lang: str,
     status_chat_id: Optional[int] = None,
     status_message_id: Optional[int] = None,
 ) -> None:
@@ -1755,7 +1680,7 @@ lang: str,
                 await _send_audio_with_retry(context, chat_id, path, caption, reply_to_message_id)
 
             else:
-                path = await loop.run_in_executor(None, _download_video, url, format_id, td, label_h)
+                path = await loop.run_in_executor(None, _download_video, url, format_id, td)
                 await _send_video_with_retry(context, chat_id, path, caption, reply_to_message_id)
 
     except Exception as e:
