@@ -998,11 +998,10 @@ def _download_video(url: str, format_id: Optional[str], workdir: str) -> Path:
             ydl_opts["merge_output_format"] = "mp4"
         else:
             # Exact itag / format_id
-            ydl_opts["format"] = (
-                f"b[format_id={format_id}]/"
-                f"bv[format_id={format_id}]+ba/"
-                f"best"
-            )
+            fid = str(format_id)
+            # Exact itag: first try progressive (audio+video) if available (e.g. 18),
+            # else merge video-only with best audio (ffmpeg needed), finally fallback to best.
+            ydl_opts["format"] = f"b[format_id={fid}]/bv[format_id={fid}]+ba/best"
             ydl_opts["merge_output_format"] = "mp4"
     else:
         ydl_opts["format"] = "bv*+ba/best"
@@ -1012,7 +1011,7 @@ def _download_video(url: str, format_id: Optional[str], workdir: str) -> Path:
         return _run_with_opts(ydl_opts)
     except Exception:
         ydl_opts_fallback = dict(ydl_opts)
-        ydl_opts_fallback["format"] = "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/best"
+        ydl_opts_fallback["format"] = "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b"
         ydl_opts_fallback["merge_output_format"] = "mp4"
         return _run_with_opts(ydl_opts_fallback)
 
