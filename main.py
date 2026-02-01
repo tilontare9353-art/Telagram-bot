@@ -105,6 +105,15 @@ BOT_USERNAME_TAG = "@universal_downloader_uzb_bot"
 CALLBACK_CACHE: Dict[str, Dict[str, Any]] = {}
 CALLBACK_CACHE_MAX = 3000
 
+
+# Telegram стандарт Bot API'да файл юклаш чегараси (одатда ~50MB).
+# Local Bot API server ишлатсангиз, бу чекловни каттароқ қила оласиз.
+TG_MAX_UPLOAD_MB = int((os.getenv("TG_MAX_UPLOAD_MB") or "49").strip() or "49")
+
+# YouTube видеолар учун Telegram file_id кеш (RAM). Шу орқали такрорий сўровларда 1 секундда юборилади.
+YOUTUBE_FILEID_CACHE: Dict[str, str] = {}
+YOUTUBE_FILEID_CACHE_MAX = 5000
+
 RUN_MODE = (os.getenv("RUN_MODE") or "").strip().lower()  # "webhook" or "polling"
 def _guess_public_base_url() -> str:
     """Webhook учун public base URL ни топиш (RUN_MODE=webhook бўлса)."""
@@ -550,6 +559,34 @@ def _best_audio_size_bytes(info: Dict[str, Any]) -> int:
     kbps = float(best.get("tbr") or best.get("abr") or 0.0)
     return _estimate_bytes_from_kbps(kbps, dur)
 
+
+def _best_video_format_under_height(info: Dict[str, Any], hmax: int) -> Optional[Dict[str, Any]]:
+    """YouTube форматларидан height<=hmax бўлган энг яхши видео форматни топади (аудиосиз видео стримлар)."""
+    formats = info.get("formats") or []
+    vids: List[Dict[str, Any]] = []
+    for f in formats:
+        try:
+            if f.get("vcodec") == "none":
+                continue
+            h = int(f.get("height") or 0)
+            if h <= 0 or h > hmax:
+                continue
+            vids.append(f)
+        except Exception:
+            continue
+    if not vids:
+        return None
+
+    def score(v: Dict[str, Any]):
+        ext = (v.get("ext") or "").lower()
+        ext_score = 2 if ext == "mp4" else (1 if ext in ("webm", "mkv") else 0)
+        tbr = float(v.get("tbr") or 0.0)
+        vbr = float(v.get("vbr") or 0.0)
+        h = int(v.get("height") or 0)
+        return (ext_score, h, max(tbr, vbr))
+
+    return sorted(vids, key=score, reverse=True)[0]
+
 def _video_total_size_bytes(info: Dict[str, Any], f: Dict[str, Any]) -> int:
     dur = info.get("duration")
     sz = int(f.get("filesize") or f.get("filesize_approx") or 0)
@@ -920,7 +957,7 @@ def _select_youtube_formats(info: Dict[str, Any]) -> List[Dict[str, Any]]:
             continue
         by_h.setdefault(h, []).append(f)
 
-    desired = [144, 240, 360, 480, 720]
+    desired = [144, 240, 360, 480, 720, 1080]
     # allow slight deviations (some uploads are 358/478/etc.)
     tol_map = {144: 40, 240: 50, 360: 60, 480: 80, 720: 140}
 
@@ -983,106 +1020,83 @@ def _select_youtube_formats(info: Dict[str, Any]) -> List[Dict[str, Any]]:
     return picked
 
 
-def _download_video(url: str, format_id: Optional[str], workdir: str) -> Path:
-    outtmpl = os.path.join(workdir, "%(id)s.%(ext)s")
+def _download_video(url: str, format_id: Optional[str], workdir: str, has_audio: Optional[bool] = None) -> Path:
+    """yt-dlp орқали видеони юклаб олиш.
+
+    format_id:
+      - рақам (YouTube itag) бўлса: шу форматни танлаймиз
+      - 'h:720' каби бўлса: height cap (<=720) бўйича танлаймиз
+      - None бўлса: bestvideo+bestaudio/best
+
+    has_audio:
+      - True  => format_id'нинг ўзида аудио бор (progressive)
+      - False => формат видео-онли (аудиосиз)
+      - None  => номаълум (safe fallback)
+    """
+    outtmpl = os.path.join(workdir, "%(title).200s.%(ext)s")
 
     def _run_with_opts(opts: Dict[str, Any]) -> Path:
-        def _do(local_opts: Dict[str, Any]) -> Path:
-            with YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=True)
+        """Run yt-dlp download and return a non-empty file path from workdir."""
+        with YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
 
-                candidates: List[Path] = []
+            candidates: List[Path] = []
+            try:
+                fp = ydl.prepare_filename(info)
+                candidates.append(Path(fp))
+            except Exception:
+                pass
+
+            req = info.get("requested_downloads") or info.get("requested_formats") or []
+            for r in req:
+                p = r.get("filepath") or r.get("filename")
+                if p:
+                    candidates.append(Path(p))
+
+            files = [p for p in Path(workdir).iterdir() if p.is_file()]
+            media = [p for p in files if p.suffix.lower() in (".mp4", ".mkv", ".webm", ".mov", ".m4a")]
+            if media:
+                candidates.insert(0, max(media, key=lambda p: p.stat().st_size))
+
+            for p in candidates:
                 try:
-                    fp = ydl.prepare_filename(info)
-                    candidates.append(Path(fp))
+                    if p.exists() and p.stat().st_size > 0:
+                        return p
                 except Exception:
-                    pass
-
-                try:
-                    for rd in (info.get("requested_downloads") or []):
-                        p = rd.get("filepath")
-                        if p:
-                            candidates.append(Path(p))
-                except Exception:
-                    pass
-
-                try:
-                    files = sorted(
-                        Path(workdir).glob("*"),
-                        key=lambda x: x.stat().st_mtime,
-                        reverse=True,
-                    )
-                    candidates.extend(files)
-                except Exception:
-                    pass
-
-                for p in candidates:
-                    try:
-                        if p.exists() and p.is_file() and p.stat().st_size > 0:
-                            return p
-                    except Exception:
-                        continue
-
-            raise RuntimeError("ERROR: The downloaded file is empty")
-
-        try:
-            return _do(opts)
-        except Exception as e:
-            msg = str(e)
-            if "Impersonate target" in msg and "not available" in msg:
-                opts.pop("impersonate", None)
-                log.warning("Impersonate o‘chirildi (mavjud emas): %s", msg)
-                return _do(opts)
-            raise
-
+                    continue
+        raise RuntimeError("Download finished but file not found")
 
     ydl_opts = build_ydl_base(outtmpl=outtmpl, workdir=workdir)
+    ydl_opts.update({
+        "merge_output_format": "mp4",
+        "postprocessors": [{"key": "FFmpegVideoConvertor", "preferedformat": "mp4"}],
+    })
 
-    if format_id:
-        # Special pseudo format: "h:720" means request max height <= 720
-        if isinstance(format_id, str) and format_id.lower().startswith("h:"):
-            try:
-                hmax = int(format_id.split(":", 1)[1])
-            except Exception:
-                hmax = 360
-            # Prefer mp4 video + m4a audio, fallback to best within height cap
-            ydl_opts["format"] = (
-                f"bv*[height<={hmax}][ext=mp4]+ba[ext=m4a]/"
-                f"bv*[height<={hmax}]+ba/"
-                f"b[height<={hmax}][ext=mp4]/b[height<={hmax}]/best"
-            )
-            ydl_opts["merge_output_format"] = "mp4"
-        else:
-            # Exact itag / format_id
-            fid = str(format_id).strip()
-            # Eng ishonchli yo‘l: itag'ni to‘g‘ridan-to‘g‘ri beramiz.
-            # Agar tanlangan format audio'ni o‘z ichiga olsa (progressive) — faqat o‘sha itag yetarli.
-            # Agar video-only bo‘lsa — bestaudio qo‘shib merge qilamiz (ffmpeg kerak).
-            if fid.isdigit():
-                if has_audio is True:
-                    ydl_opts["format"] = fid
-                elif has_audio is False:
-                    ydl_opts["format"] = f"{fid}+bestaudio/best"
-                else:
-                    # ma'lumot kelmasa, ikkala variantni ham sinab ko‘ramiz
-                    ydl_opts["format"] = f"{fid}+bestaudio/{fid}/best"
-            else:
-                # noodatiy format_id bo‘lsa (masalan h:480 bo‘lib qolsa), bestvideo/bestaudio'ga qaytamiz
-                ydl_opts["format"] = "bestvideo+bestaudio/best"
-            ydl_opts["merge_output_format"] = "mp4"
-
-
-    else:
-        ydl_opts["format"] = "bv*+ba/best"
-        ydl_opts["merge_output_format"] = "mp4"
-
-    try:
+    # 1) Height-cap pseudo: h:720
+    if format_id and str(format_id).startswith("h:"):
+        try:
+            h = int(str(format_id).split(":", 1)[1])
+        except Exception:
+            h = 720
+        ydl_opts["format"] = f"bestvideo[height<={h}][ext=mp4]+bestaudio[ext=m4a]/best[height<={h}]/best"
         return _run_with_opts(ydl_opts)
-    except Exception:
-        ydl_opts_fallback = dict(ydl_opts)
-        ydl_opts_fallback["format"] = "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b"
-        ydl_opts_fallback["merge_output_format"] = "mp4"
-        return _run_with_opts(ydl_opts_fallback)
+
+    # 2) Exact itag
+    if format_id:
+        fid = str(format_id).strip()
+        if has_audio is True:
+            ydl_opts["format"] = f"{fid}/best"
+        else:
+            ydl_opts["format"] = f"{fid}+bestaudio[ext=m4a]/bestvideo[ext=mp4]+bestaudio/best"
+        try:
+            return _run_with_opts(ydl_opts)
+        except Exception:
+            pass
+
+    # 3) Ultimate fallback
+    ydl_opts["format"] = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best"
+    return _run_with_opts(ydl_opts)
+
 
 def _download_audio(url: str, workdir: str) -> Path:
     outtmpl = os.path.join(workdir, "%(id)s.%(ext)s")
@@ -1364,13 +1378,20 @@ async def _task_show_youtube_formats(
         info = await loop.run_in_executor(None, _extract_info, url)
         formats = _select_youtube_formats(info)
 
-        # Agar yt-dlp faqat bitta video format qaytarsa (ko'pincha 360p atrofida),
-        # UI baribir 144/240/360/480/720 variantlarni ko'rsatadi.
-        # Bu variantlar "h:XXX" pseudo format bo'lib, yuklash paytida height cap sifatida ishlatiladi.
+        # Agar yt-dlp формат метамаълумотлари тўлиқ келмаса (ёки 1 та форматгина чиқса),
+        # UI барибир 144/240/360/480/720/1080 вариантларни кўрсатади.
+        # Бу вариантлар "h:XXX" pseudo format бўлиб, юклаш пайтида height cap сифатида ишлатилади.
+        # Лекин ҳажмни кўрсатиш учун real форматдан (height<=cap) битрейт/хажмни тахмин қиламиз.
         if not formats or len(formats) < 2:
             formats = []
-            for h in (144, 240, 360, 480, 720):
-                formats.append({"format_id": f"h:{h}", "height": h, "_label_h": h})
+            for h in (144, 240, 360, 480, 720, 1080):
+                best = _best_video_format_under_height(info, h)
+                pseudo: Dict[str, Any] = {"format_id": f"h:{h}", "height": h, "_label_h": h, "acodec": "none"}
+                if best:
+                    pseudo["tbr"] = best.get("tbr") or best.get("vbr") or 0.0
+                    pseudo["filesize"] = best.get("filesize") or 0
+                    pseudo["filesize_approx"] = best.get("filesize_approx") or 0
+                formats.append(pseudo)
 
         # Buttonlar: faqat 144/240/360/480/720 (mavjud bo‘lsa)
         btns: List[InlineKeyboardButton] = []
@@ -1379,12 +1400,18 @@ async def _task_show_youtube_formats(
             h = int(f.get("height") or 0)
             label_h = int(f.get("_label_h") or h)
 
+            has_audio = str(f.get("acodec") or "").lower() not in ("", "none")
+            ytid = str(info.get("id") or "")
+            yt_key = f"yt:{ytid}:{label_h}p" if ytid else None
+
             total_bytes = _video_total_size_bytes(info, f)
             size = human_mb_compact(total_bytes)
             label = f"{label_h}p - {size}" if size else f"{label_h}p"
 
             token = _cache_put({
                 "url": url, "kind": "video", "format_id": fmt_id,
+                "has_audio": has_audio,
+                "yt_key": yt_key,
                 "origin_chat_id": origin_chat_id, "origin_message_id": origin_message_id,
                 "lang": lang,
             })
@@ -1499,6 +1526,8 @@ async def on_download_button(update: Update, context: ContextTypes.DEFAULT_TYPE)
     url = payload["url"]
     kind = payload["kind"]
     format_id = payload.get("format_id")
+    has_audio = payload.get("has_audio")
+    yt_key = payload.get("yt_key")
     lang = payload.get("lang") or lang
 
     origin_chat_id = int(payload.get("origin_chat_id") or (q.message.chat_id if q.message else update.effective_chat.id))
@@ -1526,6 +1555,8 @@ async def on_download_button(update: Update, context: ContextTypes.DEFAULT_TYPE)
         url=url,
         kind=kind,
         format_id=format_id,
+        has_audio=has_audio,
+        yt_key=yt_key,
         lang=lang,
         status_chat_id=status_chat_id,
         status_message_id=status_message_id,
@@ -1560,24 +1591,26 @@ async def _send_video_with_retry(
     path: Path,
     caption: str,
     reply_to_message_id: Optional[int],
-) -> None:
+):
+    """Видео юбориш (2 марта retry) ва Message'ни қайтариш (file_id кеш учун)."""
     last_exc: Optional[Exception] = None
     for _ in range(2):
         try:
             with open(path, "rb") as f:
-                await context.bot.send_video(
+                msg = await context.bot.send_video(
                     chat_id=chat_id,
                     video=f,
                     supports_streaming=True,
                     caption=caption,
                     reply_to_message_id=reply_to_message_id,
                 )
-            return
+            return msg
         except TimedOut as e:
             last_exc = e
             await asyncio.sleep(2)
     if last_exc:
         raise last_exc
+    raise RuntimeError("send_video failed")
 
 async def _send_document_with_retry(
     context: ContextTypes.DEFAULT_TYPE,
@@ -1730,6 +1763,8 @@ async def _task_download_and_send(
     url: str,
     kind: str,
     format_id: Optional[str],
+    has_audio: Optional[bool],
+    yt_key: Optional[str],
     lang: str,
     status_chat_id: Optional[int] = None,
     status_message_id: Optional[int] = None,
@@ -1748,8 +1783,56 @@ async def _task_download_and_send(
                 await _send_audio_with_retry(context, chat_id, path, caption, reply_to_message_id)
 
             else:
-                path = await loop.run_in_executor(None, _download_video, url, format_id, td)
-                await _send_video_with_retry(context, chat_id, path, caption, reply_to_message_id)
+                # 1) Агар шу видео+формат аввал юборилган бўлса — Telegram file_id билан дарҳол юборамиз.
+                if yt_key:
+                    fid_cached = YOUTUBE_FILEID_CACHE.get(yt_key)
+                    if fid_cached:
+                        try:
+                            await context.bot.send_video(
+                                chat_id=chat_id,
+                                video=fid_cached,
+                                supports_streaming=True,
+                                caption=caption,
+                                reply_to_message_id=reply_to_message_id,
+                            )
+                            return
+                        except Exception:
+                            YOUTUBE_FILEID_CACHE.pop(yt_key, None)
+
+                # 2) Юклаб оламиз
+                path = await loop.run_in_executor(None, _download_video, url, format_id, td, has_audio)
+
+                # 3) Upload лимити (api.telegram.org учун одатда ~50MB). Local Bot API server бўлса TG_MAX_UPLOAD_MB'ни катта қилиб қўйинг.
+                try:
+                    size_mb = path.stat().st_size / (1024 * 1024)
+                except Exception:
+                    size_mb = 0.0
+
+                if TG_MAX_UPLOAD_MB > 0 and size_mb > TG_MAX_UPLOAD_MB:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=_t(
+                            lang,
+                            "err_generic",
+                            err=(
+                                f"Файл ҳажми {size_mb:.1f}MB. Telegram Bot API upload чеклови туфайли юборилмади (лимит: {TG_MAX_UPLOAD_MB}MB). "
+                                "Пастроқ формат танланг ёки Local Bot API server ишлатинг."
+                            ),
+                        ),
+                        reply_to_message_id=reply_to_message_id,
+                    )
+                    return
+
+                # 4) Юбориш ва file_id кешлаш
+                msg = await _send_video_with_retry(context, chat_id, path, caption, reply_to_message_id)
+                if yt_key and msg and getattr(msg, "video", None) is not None:
+                    try:
+                        YOUTUBE_FILEID_CACHE[yt_key] = msg.video.file_id
+                        if len(YOUTUBE_FILEID_CACHE) > YOUTUBE_FILEID_CACHE_MAX:
+                            k = next(iter(YOUTUBE_FILEID_CACHE.keys()))
+                            YOUTUBE_FILEID_CACHE.pop(k, None)
+                    except Exception:
+                        pass
 
     except Exception as e:
         log.exception("Download/send xato: %s", e)
@@ -1762,7 +1845,6 @@ async def _task_download_and_send(
         except Exception:
             pass
     finally:
-        # "⏳ ..." ogohlantirishini o‘chiramiz
         if status_chat_id and status_message_id:
             try:
                 await context.bot.delete_message(chat_id=status_chat_id, message_id=status_message_id)
