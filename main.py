@@ -1017,6 +1017,12 @@ def _download_video(url: str, format_id: Optional[str], workdir: str) -> Path:
 
     ydl_opts = build_ydl_base(outtmpl=outtmpl, workdir=workdir)
 
+    # NOTE: Some YouTube formats already include audio+video (progressive). In that case,
+    # requesting "<itag>+bestaudio" can fail with "Requested format is not available".
+    # We therefore prefer the exact combined format first, then fall back to merging (if ffmpeg exists),
+    # and finally to a generic "best" selector.
+    ff_ok = bool(ydl_opts.get("ffmpeg_location")) or bool(shutil.which("ffmpeg"))
+
     if format_id:
         # Special pseudo format: "h:720" means request max height <= 720
         if isinstance(format_id, str) and format_id.lower().startswith("h:"):
@@ -1024,26 +1030,38 @@ def _download_video(url: str, format_id: Optional[str], workdir: str) -> Path:
                 hmax = int(format_id.split(":", 1)[1])
             except Exception:
                 hmax = 360
-            # Prefer mp4 video + m4a audio, fallback to best within height cap
-            ydl_opts["format"] = (
-                f"bv*[height<={hmax}][ext=mp4]+ba[ext=m4a]/"
-                f"bv*[height<={hmax}]+ba/"
-                f"b[height<={hmax}][ext=mp4]/b[height<={hmax}]/best"
-            )
+
+            if ff_ok:
+                # Try progressive first (no merge needed), then mergeable streams, then best within cap
+                ydl_opts["format"] = (
+                    f"b[height<={hmax}][ext=mp4]/b[height<={hmax}]/"
+                    f"bv*[height<={hmax}][ext=mp4]+ba[ext=m4a]/"
+                    f"bv*[height<={hmax}]+ba/"
+                    f"best[height<={hmax}]/best"
+                )
+            else:
+                # No ffmpeg: avoid requiring merges
+                ydl_opts["format"] = f"b[height<={hmax}][ext=mp4]/b[height<={hmax}]/best[height<={hmax}]/best"
+
             ydl_opts["merge_output_format"] = "mp4"
         else:
-            # Exact itag / format_id
-            ydl_opts["format"] = f"{format_id}+bestaudio/{format_id}/best"
+            # Exact itag / format_id (prefer the exact progressive format first)
+            fid = str(format_id)
+            if ff_ok:
+                ydl_opts["format"] = f"b[format_id={fid}]/bv[format_id={fid}]+ba/best"
+            else:
+                ydl_opts["format"] = f"b[format_id={fid}]/b/best"
             ydl_opts["merge_output_format"] = "mp4"
     else:
-        ydl_opts["format"] = "bv*+ba/best"
+        ydl_opts["format"] = "bv*+ba/b" if ff_ok else "b/best"
         ydl_opts["merge_output_format"] = "mp4"
 
     try:
         return _run_with_opts(ydl_opts)
     except Exception:
         ydl_opts_fallback = dict(ydl_opts)
-        ydl_opts_fallback["format"] = "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b"
+        # Ultra-safe fallback: prefer progressive (no merge), then any best.
+        ydl_opts_fallback["format"] = "b[ext=mp4]/b/best" if ff_ok else "b/best"
         ydl_opts_fallback["merge_output_format"] = "mp4"
         return _run_with_opts(ydl_opts_fallback)
 
