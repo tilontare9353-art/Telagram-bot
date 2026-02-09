@@ -1,6 +1,4 @@
-python-telegram-bot>=20.7
-yt-dlp[default]>=2026.02.04
+python-telegram-bot>=21.6
 asyncpg
-python-dotenv
-gallery-dl
-curl-cffi
+Flask>=3,<4
+waitress>=2.1.2
