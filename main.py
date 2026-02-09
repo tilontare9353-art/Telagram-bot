@@ -1,1920 +1,2586 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
-"""
-Universal Downloader Bot (Railway-ready, python-telegram-bot v20+)
+from telegram import Chat, Message, Update, BotCommand, BotCommandScopeAllPrivateChats, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ChatMemberStatus, ParseMode
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, ChatMemberHandler, ContextTypes, filters
 
-Asosiy imkoniyatlar:
-- YouTube: faqat MAVJUD formatlar tugmalari chiqadi (144p/360p/720p... mavjud bo'lsa bor).
-- TikTok/Instagram/Facebook va boshqalar: 📹 Video + 🎵 Audio tugmalari.
-- Guruhda: bot media faylni aynan link yuborilgan xabar ostiga REPLY qilib tashlaydi.
-- /broadcast va /broadcastpost (faqat admin) — start bosgan foydalanuvchilarga.
+import threading
+import os
+import re
+import html
+import logging
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 
-Til:
-- /start da til tanlash: 🇺🇿 O‘zbekcha / 🇷🇺 Русский
-- O‘zbekcha salomlashish matni o'zgarmaydi.
-- Ruscha tanlanganda barcha asosiy yozuvlar ruscha chiqadi.
-
-Railway/Cloud учун:
-- Tavsiya: polling режими (RUN_MODE=polling). Webhook ҳам мумкин (RUN_MODE=webhook).
-- ENV:
-  BOT_TOKEN          (majburiy)
-  ADMIN_IDS          (ixtiyoriy) "123,456"
-  DATABASE_URL       (tavsiya) Postgres connection string (Railway Postgres ёки бошқа)
-  WEBHOOK_URL        (webhook rejimi uchun) масалан: https://<your-domain>
-  WEBHOOK_PATH       (ixtiyoriy) default: webhook
-  PORT               (webhook режимда платформа беради: Railway ва бошқалар)
-  DATA_DIR           (fallback json storage uchun; cloud серверда тавсия этилмайди)
-
-Eslatma:
-- MP3 konvertatsiya uchun ffmpeg tavsiya qilinadi. Bo'lmasa m4a/webm audio yuboriladi.
-"""
+from flask import Flask
 
 try:
-    from dotenv import load_dotenv
-    load_dotenv()
+    from waitress import serve  # production-grade WSGI server (Railway uchun tavsiya)
 except Exception:
-    # python-dotenv optional (local test учун)
-    pass
+    serve = None
 
-import os
-import uuid
-import re
-import json
+# --- New (Postgres) ---
 import asyncio
-import logging
-import tempfile
-import shutil
-import secrets
-import base64
-import html
-import subprocess
-import zipfile
-import urllib.request
-import urllib.error
-from urllib.parse import urlsplit, urlunsplit, urlparse
-from pathlib import Path
-from typing import Dict, Any, Optional, Tuple, List
-
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Message, User
-from telegram.constants import ParseMode
-from telegram.request import HTTPXRequest
-from telegram.error import TimedOut
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    filters,
-)
-
-from yt_dlp import YoutubeDL
+import json
+import ssl
+from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+from typing import List, Optional
 
 try:
     import asyncpg
-except Exception:
-    asyncpg = None  # fallback to json storage
+except ImportError:
+    asyncpg = None  # handled below with a log warning
 
 
-# ---------------------------- Config ----------------------------
+# ---------------------- Linked channel helpers ----------------------
+def _extract_forward_origin_chat(msg: Message):
+    fo = getattr(msg, "forward_origin", None)
+    if fo is not None:
+        chat = getattr(fo, "chat", None) or getattr(fo, "from_chat", None)
+        if chat is not None:
+            return chat
+    return getattr(msg, "forward_from_chat", None)
 
-TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
+
+# ---- Linked channel cache helpers (added) ----
+_GROUP_LINKED_ID_CACHE: dict[int, int | None] = {}
+
+async def _get_linked_id(chat_id: int, bot) -> int | None:
+    """Fetch linked_chat_id reliably using get_chat (cached)."""
+    if chat_id in _GROUP_LINKED_ID_CACHE:
+        return _GROUP_LINKED_ID_CACHE[chat_id]
+    try:
+        chat = await bot.get_chat(chat_id)
+        linked_id = getattr(chat, "linked_chat_id", None)
+        _GROUP_LINKED_ID_CACHE[chat_id] = linked_id
+        return linked_id
+    except Exception:
+        _GROUP_LINKED_ID_CACHE[chat_id] = None
+        return None
+
+async def is_linked_channel_autoforward(msg: Message, bot) -> bool:
+    """
+    TRUE faqat guruhning bog'langan kanalidan avtomatik forward bo'lgan postlar uchun.
+    - msg.is_automatic_forward True
+    - get_chat(chat_id).linked_chat_id mavjud
+    - va (sender_chat.id == linked_id) yoki (forward_origin chat.id == linked_id)
+    - origin yashirilgan bo‘lsa ham fallback True (is_automatic_forward bo‘lsa)
+    """
+    try:
+        if not getattr(msg, "is_automatic_forward", False):
+            return False
+        linked_id = await _get_linked_id(msg.chat_id, bot)
+        if not linked_id:
+            return False
+        sc = getattr(msg, "sender_chat", None)
+        if sc and getattr(sc, "id", None) == linked_id:
+            return True
+        fwd_chat = _extract_forward_origin_chat(msg)
+        if fwd_chat and getattr(fwd_chat, "id", None) == linked_id:
+            return True
+        # Fallback: origin yashirilgan bo‘lishi mumkin
+        return True
+    except Exception:
+        return False
+
+
+# ---------------------- Small keep-alive web server ----------------------
+app_flask = Flask(__name__)
+
+@app_flask.route("/")
+def home():
+    return "Bot ishlayapti!"
+
+def run_web():
+    port = int(os.getenv("PORT", "8080"))
+    if serve:
+        serve(app_flask, host="0.0.0.0", port=port)
+    else:
+        # Fallback: Flask dev server (agar waitress o'rnatilmagan bo'lsa)
+        app_flask.run(host="0.0.0.0", port=port)
+
+def start_web():
+    # Railway "web" service uchun PORT talab qilinadi.
+    # Agar siz botni "worker" sifatida ishga tushirsangiz, ENABLE_WEB=0 qilib qo'ying.
+    enable = os.getenv("ENABLE_WEB")
+    if enable is None:
+        enable = "1" if os.getenv("PORT") else "0"
+    if str(enable).strip() in ("1", "true", "True", "yes", "YES"):
+        threading.Thread(target=run_web, daemon=True).start()
+
+
+# ---------------------- Config ----------------------
+logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
+log = logging.getLogger(__name__)
+
+TOKEN = os.getenv("TOKEN")
 if not TOKEN:
-    raise RuntimeError("BOT_TOKEN env topilmadi ('.env' borligini va BOT_TOKEN to'g'ri yozilganini tekshiring)")
+    raise RuntimeError("TOKEN env o'rnatilmagan. Railway Variables ga TOKEN=... qo'ying.")
+WHITELIST = {165553982, "Yunus1995"}
+TUN_REJIMI = False
+KANAL_USERNAME = None
 
-ADMIN_IDS: set[int] = set()
-_admin_raw = (os.getenv("ADMIN_IDS") or "").strip()
-if _admin_raw:
-    for part in _admin_raw.split(","):
-        part = part.strip()
-        if part.isdigit():
-            ADMIN_IDS.add(int(part))
+MAJBUR_LIMIT = 0
+FOYDALANUVCHI_HISOBI = defaultdict(int)
+RUXSAT_USER_IDS = set()
+BLOK_VAQTLARI = {}  # (chat_id, user_id) -> until_datetime (UTC)
+MAJBUR_WARN_MSG_IDS = {}  # (chat_id, user_id) -> last warning message_id
+KANAL_WARN_MSG_IDS = {}   # (chat_id, user_id) -> last warning message_id
 
-DATA_DIR = Path((os.getenv("DATA_DIR") or ".")).resolve()
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-# Fallback json storage (cloud серверда тавсия этилмайди)
-USERS_FILE = DATA_DIR / "users.json"
-PREFS_FILE = DATA_DIR / "prefs.json"
-
-DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
-
-BOT_USERNAME_TAG = "@universal_downloader_uzb_bot"
-
-CALLBACK_CACHE: Dict[str, Dict[str, Any]] = {}
-CALLBACK_CACHE_MAX = 3000
-
-
-# Telegram стандарт Bot API'да файл юклаш чегараси (одатда ~50MB).
-# Local Bot API server ишлатсангиз, бу чекловни каттароқ қила оласиз.
-TG_MAX_UPLOAD_MB = int((os.getenv("TG_MAX_UPLOAD_MB") or "49").strip() or "49")
-
-# YouTube видеолар учун Telegram file_id кеш (RAM). Шу орқали такрорий сўровларда 1 секундда юборилади.
-YOUTUBE_FILEID_CACHE: Dict[str, str] = {}
-YOUTUBE_FILEID_CACHE_MAX = 5000
-
-RUN_MODE = (os.getenv("RUN_MODE") or "").strip().lower()  # "webhook" or "polling"
-def _guess_public_base_url() -> str:
-    """Webhook учун public base URL ни топиш (RUN_MODE=webhook бўлса)."""
-    v = (os.getenv("WEBHOOK_URL") or "").strip()
-    if v:
-        return v.rstrip("/")
-    # Railway: best-effort (ҳамма аккаунтларда бўлмаслиги мумкин)
-    dom = (os.getenv("RAILWAY_PUBLIC_DOMAIN") or os.getenv("RAILWAY_STATIC_DOMAIN") or "").strip()
-    if dom:
-        return f"https://{dom}".rstrip("/")
-    v = (os.getenv("RAILWAY_PUBLIC_URL") or "").strip()
-    if v:
-        return v.rstrip("/")
-    # Render (ixtiyoriy fallback, агар керак бўлса)
-    v = (os.getenv("RENDER_EXTERNAL_URL") or "").strip()
-    if v:
-        return v.rstrip("/")
-    return ""
-
-WEBHOOK_URL_BASE = _guess_public_base_url()
-WEBHOOK_PATH = (os.getenv("WEBHOOK_PATH") or "webhook").strip().lstrip("/")
-PORT = int(os.getenv("PORT") or "8080")
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-log = logging.getLogger("downloader")
-
-
-# ---------------------------- i18n ----------------------------
-
-LANG_UZ = "uz"
-LANG_RU = "ru"
-
-START_TEXT_UZ = (
-    "👋🏻 <b>Salom</b>\n"
-    "Telegramdagi <b>YouTube</b>’dan, <b>Tiktokdan</b>, <b>Instagram</b> va <b>Focebook</b>dan video, audiolarni yuklab olish uchun eng tezkor "
-    f"{BOT_USERNAME_TAG} ga xush kelibsiz.\n\n"
-    "✅ <b>Botning imkoniyatlari:</b>\n"
-    "✨ Youtubedan Video sifatini tanlash imkoniyati;\n"
-    "📁 Video va audioni saqlab olish(cheksiz);\n"
-    "💫 Yuklab olingan faylni do'stlarga ulashish;\n"
-    "ℹ️ Botni guruxingizda admin qiling va guruhga yuborilgan havolalarni video ko’rinishida guruxingizga shu havola ostiga tashlab beradi.\n"
-    "ℹ️ <b>Botni guruxingizda reklama tarqatmaydi</b>.\n"
-    "ℹ️ Biror bir xatolikga duch kelsangiz bizni botlar kanaliga o’ting va u yerdagi adminlarga habar bering.\n"
-    "Bizning foydali botlar kanali 👉 https://t.me/+skp5TgimYIJjYzIy\n\n"
-    "🔗 <b>BOSHLASH UCHUN VIDEO HAVOLASINI YUBORING</b>…⤵️"
+# ✅ To'liq yozish ruxsatlari (guruh sozlamalari ruxsat bergan taqdirda)
+FULL_PERMS = ChatPermissions(
+    can_send_messages=True,
+    can_send_audios=True,
+    can_send_documents=True,
+    can_send_photos=True,
+    can_send_videos=True,
+    can_send_video_notes=True,
+    can_send_voice_notes=True,
+    can_send_polls=True,
+    can_send_other_messages=True,
+    can_add_web_page_previews=True,
+    can_invite_users=True,
 )
 
-START_TEXT_RU = (
-    "👋🏻 <b>Привет</b>\n"
-    "Добро пожаловать в самый быстрый бот, чтобы скачивать видео и аудио из <b>YouTube</b>, <b>TikTok</b>, <b>Instagram</b> и <b>Facebook</b>: "
-    f"{BOT_USERNAME_TAG}\n\n"
-    "✅ <b>Возможности бота:</b>\n"
-    "✨ Выбор качества видео YouTube;\n"
-    "📁 Скачивание видео и аудио (без ограничений);\n"
-    "💫 Возможность делиться скачанным файлом с друзьями;\n"
-    "ℹ️ Сделайте бота администратором в группе — и он будет отправлять скачанное видео ответом под сообщением со ссылкой.\n"
-    "ℹ️ <b>Бот не распространяет рекламу в вашей группе</b>.\n"
-    "ℹ️ Если столкнётесь с ошибкой — перейдите в наш канал ботов и напишите администраторам.\n"
-    "Наш полезный канал ботов 👉 https://t.me/+skp5TgimYIJjYzIy\n\n"
-    "🔗 <b>ДЛЯ НАЧАЛА ОТПРАВЬТЕ ССЫЛКУ НА ВИДЕО</b>…⤵️"
+# Blok uchun ruxsatlar (1 daqiqa): faqat yozish yopiladi, odam qo'shishga ruxsat qoldiriladi
+BLOCK_PERMS = ChatPermissions(
+    can_send_messages=False,
+    can_send_audios=False,
+    can_send_documents=False,
+    can_send_photos=False,
+    can_send_videos=False,
+    can_send_video_notes=False,
+    can_send_voice_notes=False,
+    can_send_polls=False,
+    can_send_other_messages=False,
+    can_add_web_page_previews=False,
+    can_invite_users=True,
 )
 
-TEXT = {
-    "choose_lang": {
-        LANG_UZ: "Tilni tanlang:",
-        LANG_RU: "Выберите язык:",
-    },
-    "btn_uz": {LANG_UZ: "🇺🇿 O‘zbekcha", LANG_RU: "🇺🇿 O‘zbekcha"},
-    "btn_ru": {LANG_UZ: "🇷🇺 Русский", LANG_RU: "🇷🇺 Русский"},
-    "yt_fetching": {
-        LANG_UZ: "🔎 YouTube formatlar olinmoqda...",
-        LANG_RU: "🔎 Получаю форматы YouTube...",
-    },
-    "choose": {LANG_UZ: "Tanlang:", LANG_RU: "Выберите:"},
-    "btn_video": {LANG_UZ: "📹 Video yuklab olish", LANG_RU: "📹 Скачать видео"},
-    "btn_audio": {LANG_UZ: "🎵 Audio", LANG_RU: "🎵 Аудио"},
-    "btn_mp3": {LANG_UZ: "🎵 MP3", LANG_RU: "🎵 MP3"},
-    "tt_photo_audio_only": {
-        LANG_UZ: "Bu TikTok foto-post (/photo/). Faqat audio (MP3) yuklash mumkin:",
-        LANG_RU: "Это TikTok фото-пост (/photo/). Доступно только аудио (MP3):",
-    },
-    "btn_tt_photo": {LANG_UZ: "🖼 Foto post (ZIP)", LANG_RU: "🖼 Фото-пост (ZIP)"},
-    "tt_photo_only": {
-        LANG_UZ: "Bu TikTok foto-post (/photo/). Rasmlarni ZIP ko‘rinishida yuklab oling:",
-        LANG_RU: "Это TikTok фото-пост (/photo/). Скачайте картинки в ZIP:",
-    },
-    "yt_caption": {
-        LANG_UZ: "📹 <b>{title}</b>\n⏱ {dur}\n\n<b>Formatni tanlang:</b>",
-        LANG_RU: "📹 <b>{title}</b>\n⏱ {dur}\n\n<b>Выберите формат:</b>",
-    },
-    "yt_choose_fmt": {
-        LANG_UZ: "Formatni tanlang (YouTube):",
-        LANG_RU: "Выберите формат (YouTube):",
-    },
-    "btn_expired": {
-        LANG_UZ: "❌ Bu tugma eskirib qolgan. Iltimos linkni qayta yuboring.",
-        LANG_RU: "❌ Эта кнопка устарела. Пожалуйста, отправьте ссылку ещё раз.",
-    },
-    "downloading_answer": {
-        LANG_UZ: "⏳ Yuklab olinmoqda...",
-        LANG_RU: "⏳ Скачиваю...",
-    },
-    "downloading_wait": {
-        LANG_UZ: "⏳ Yuklab olinmoqda, iltimos kuting...",
-        LANG_RU: "⏳ Скачиваю, пожалуйста подождите...",
-    },
-    "fmt_error": {
-        LANG_UZ: "❌ Formatlarni olishda xatolik: {err}",
-        LANG_RU: "❌ Ошибка при получении форматов: {err}",
-    },
+# So'kinish lug'ati (qisqartirilgan, aslidagi ro'yxat saqlandi)
+UYATLI_SOZLAR = {
+    # --- Latin (alfavit) ---
+    "am",
+    "am latta",
+    "am yalayman",
+    "am yaliman",
+    "aminga",
+    "aminga sikay",
+    "aminga ske",
+    "amlar",
+    "amlatta",
+    "ammisan",
+    "ammisan?",
+    "ammisizlar",
+    "ammisizlar?",
+    "ammislar",
+    "ammislar?",
+    "amsan",
+    "amxor",
+    "amyalaq",
+    "amyalar",
+    "amyaloq",
+    "biyindi ami",
+    "biyundiami",
+    "blya",
+    "blyat",
+    "buyindi omi",
+    "buyingdi ami",
+    "buyingdi omi",
+    "buyingni ami",
+    "buynami",
+    "buyundiomi",
+    "chochaq",
+    "chochoq",
+    "dalbayob",
+    "dalbayoblar",
+    "dalbayobmisan",
+    "dalbayobmisan?",
+    "debil",
+    "dolboyob",
+    "durak",
+    "fakyou",
+    "fohisha",
+    "fohishalar",
+    "fohishamisan?",
+    "fohishasan",
+    "foxisha",
+    "foxishalar",
+    "foxishamisan?",
+    "foxishasan",
+    "fuck",
+    "fuckyou",
+    "g'ar",
+    "gandon",
+    "gandonlar",
+    "gandonmisan",
+    "gandonmisan?",
+    "haromi",
+    "haromilar",
+    "horomi",
+    "horomilar",
+    "huy",
+    "huygami",
+    "huyimga",
+    "idin naxuy",
+    "idin naxxuy",
+    "idinaxxuy",
+    "idinnaxxuy",
+    "isqirt",
+    "isqirtlar",
+    "isqirtsan",
+    "jalap",
+    "jalapkot",
+    "jalapkoz",
+    "jalaplar",
+    "jalapsan",
+    "ko't",
+    "ko'tak",
+    "ko'tinga",
+    "ko'tlar",
+    "ko'tmisan",
+    "ko'tsan",
+    "kot",
+    "kotagim",
+    "kotak",
+    "kotinga",
+    "kotinga sikay",
+    "kotinga ske",
+    "kotingaske",
+    "kotingga",
+    "kotlar",
+    "kotmisan",
+    "kotmisan?",
+    "kotmisizlar",
+    "kotmisizlar?",
+    "kotmislar",
+    "kotmislar?",
+    "kotsan",
+    "kotvacha",
+    "kutagim",
+    "lanat",
+    "lanati",
+    "lanatilar",
+    "lanatisan",
+    "mudak",
+    "naxxuy",
+    "og'zinga skay",
+    "og'zinga skey",
+    "og'zingaskay",
+    "ogzinga skay",
+    "ogzinga skey",
+    "ogzingaskay",
+    "onagni ami",
+    "onagni omi",
+    "onagniomi",
+    "onangniami",
+    "otni qotagi",
+    "otti qo'tag'i",
+    "otti qotagi",
+    "padarlanat",
+    "padarlanatlar",
+    "padarlanatsan",
+    "pashol naxuy",
+    "pasholnaxuy",
+    "pasholnaxxuy",
+    "pidor",
+    "poshol naxxuy",
+    "posholnaxxuy",
+    "poxuy",
+    "poxxuy",
+    "qanjik",
+    "qanjiq",
+    "qanjiqlar",
+    "qanjiqsan",
+    "qo'tag'im",
+    "qo'taq",
+    "qo'taqxo'r",
+    "qo'tog'lar",
+    "qo'toqlar",
+    "qonjiq",
+    "qotag'im",
+    "qotagim",
+    "qotaq",
+    "qotaqlar",
+    "qotaqmisan",
+    "qotaqsan",
+    "qotaqxor",
+    "qotoglar",
+    "qotoqlar",
+    "sik",
+    "sikalak",
+    "sikaman",
+    "sikasizmi",
+    "sikay",
+    "sikey",
+    "sikish",
+    "sikishaman",
+    "sikishamiz",
+    "sikishish",
+    "skaman",
+    "skasizmi",
+    "skay",
+    "skey",
+    "skishaman",
+    "skishamiz",
+    "skishamizmi?",
+    "skiy",
+    "soska",
+    "suka",
+    "sukalar",
+    "tashak",
+    "tashaklar",
+    "tashaq",
+    "tashaqlar",
+    "toshok",
+    "toshoq",
+    "toshoqlar",
+    "xaromi",
+    "xoramilar",
+    "xoromi",
+    "xoromilar",
+    "xuramilar",
+    "xuy",
+    "xuyna",
 
-    "err_filename_too_long": {
-        LANG_UZ: "❌ Fayl nomi juda uzun bo‘lib кетди (server cheklovi). Boshqa variantni tanlang yoki linkni qayta yuboring.",
-        LANG_RU: "❌ Слишком длинное имя файла (ограничение сервера). Выберите другой вариант или отправьте ссылку заново.",
-    },
-    "yt_need_cookies": {
-        LANG_UZ: "❌ YouTube «men robot emasman» tekshiruvini so‘radi. YouTube ишлаши учун (cloud серверда) браузердан экспорт қилинган Netscape formatdagi cookies.txt kerak.",
-        LANG_RU: "❌ YouTube требует подтверждение «я не бот». Cloud серверда YouTube учун ҳам керак:  cookies.txt, экспортированный из браузера (формат Netscape).",
-    },
-    
-    "yt_403": {
-        LANG_UZ: "❌ YouTube 403 Forbidden. Bu odatda cloud/datacenter IP blok ёки cookies eskirganidan bo‘ladi. Cookies.txt ni yangilang (login bo‘lgan brauzerdan eksport), yoki Proxy/VPS (rezident IP) ishlating.",
-        LANG_RU: "❌ YouTube 403 Forbidden. Обычно это блокировка cloud/datacenter IP или устаревшие cookies. Обновите cookies.txt (экспорт из залогиненного браузера) или используйте Proxy/VPS (резидентный IP).",
-    },
-
-    "yt_botcheck_even_with_cookies": {
-        LANG_UZ: "❌ YouTube «men robot emasman» tekshiruvini so‘radi. Cookies топилган бўлса ҳам cloud/IP блок сабабли baribir captcha chiqishi mumkin. Cookies.txt ni yangilang (login bo‘lgan brauzerdan), yoki VPS/Proxy (rezident IP) ishlating.",
-        LANG_RU: "❌ YouTube просит подтверждение «я не бот». Ҳатто cookies билан ҳам cloud (datacenter IP) капча может появляться. Обновите cookies.txt (из залогиненного браузера) или используйте VPS/Proxy (резидентный IP).",
-    },
-"err_generic": {LANG_UZ: "❌ Xatolik: {err}", LANG_RU: "❌ Ошибка: {err}"},
-    "not_admin": {LANG_UZ: "❌ Siz admin emassiz.", LANG_RU: "❌ Вы не админ."},
-    "usage_broadcast": {
-        LANG_UZ: "Ishlatish: /broadcast xabar_matni",
-        LANG_RU: "Использование: /broadcast текст_сообщения",
-    },
-    "bc_started": {
-        LANG_UZ: "📣 Broadcast boshlandi. Users: {n}",
-        LANG_RU: "📣 Рассылка началась. Пользователей: {n}",
-    },
-    "bc_done": {
-        LANG_UZ: "✅ Yakunlandi. Yuborildi: {sent}, Xato: {failed}",
-        LANG_RU: "✅ Готово. Отправлено: {sent}, Ошибок: {failed}",
-    },
-    "usage_broadcastpost": {
-        LANG_UZ: "Ishlatish: Kerakli postga reply qiling va /broadcastpost yozing.",
-        LANG_RU: "Использование: Ответьте на нужный пост и отправьте /broadcastpost.",
-    },
-    "bcpost_started": {
-        LANG_UZ: "📣 BroadcastPost boshlandi. Users: {n}",
-        LANG_RU: "📣 Пересылка поста началась. Пользователей: {n}",
-    },
-    "caption_suffix": {
-        LANG_UZ: f"{BOT_USERNAME_TAG} da yuklab olindi",
-        LANG_RU: f"Скачано в {BOT_USERNAME_TAG}",
-    },
+    # --- Krill (alfavit) ---
+    "ам",
+    "ам латта",
+    "ам ялайман",
+    "ам ялиман",
+    "аминга",
+    "аминга сикай",
+    "аминга ске",
+    "амлар",
+    "амлатта",
+    "аммисан",
+    "аммисан?",
+    "аммисизлар",
+    "аммисизлар?",
+    "аммислар",
+    "аммислар?",
+    "амсан",
+    "амхор",
+    "амялар",
+    "амялақ",
+    "амялоқ",
+    "бийинди ами",
+    "биюндиами",
+    "бля",
+    "блят",
+    "буйингди ами",
+    "буйингди оми",
+    "буйингни ами",
+    "буйинди оми",
+    "буйнами",
+    "буюндиоми",
+    "гандон",
+    "гандонлар",
+    "гандонмисан",
+    "гандонмисан?",
+    "далбаёб",
+    "далбаёблар",
+    "далбаёбмисан",
+    "далбаёбмисан?",
+    "дебил",
+    "долбоёб",
+    "дурак",
+    "жалап",
+    "жалапкоз",
+    "жалапкот",
+    "жалаплар",
+    "жалапсан",
+    "идин нахуй",
+    "идин наххуй",
+    "идинаххуй",
+    "идиннаххуй",
+    "исқирт",
+    "исқиртлар",
+    "исқиртсан",
+    "кот",
+    "котагим",
+    "котак",
+    "котвача",
+    "котинга",
+    "котинга сикай",
+    "котинга ске",
+    "котингаске",
+    "котингга",
+    "котлар",
+    "котмисан",
+    "котмисан?",
+    "котмисизлар",
+    "котмисизлар?",
+    "котмислар",
+    "котмислар?",
+    "котсан",
+    "кутагим",
+    "кўт",
+    "кўтак",
+    "кўтинга",
+    "кўтлар",
+    "кўтмисан",
+    "кўтсан",
+    "ланат",
+    "ланати",
+    "ланатилар",
+    "ланатисан",
+    "мудак",
+    "наххуй",
+    "огзинга скай",
+    "огзинга скей",
+    "огзингаскай",
+    "онагни ами",
+    "онагни оми",
+    "онагниоми",
+    "онангниами",
+    "отни қотаги",
+    "отти қотаги",
+    "отти қўтағи",
+    "оғзинга скай",
+    "оғзинга скей",
+    "оғзингаскай",
+    "падарланат",
+    "падарланатлар",
+    "падарланатсан",
+    "пашол нахуй",
+    "пашолнахуй",
+    "пашолнаххуй",
+    "пидор",
+    "похуй",
+    "поххуй",
+    "пошол наххуй",
+    "пошолнаххуй",
+    "сик",
+    "сикай",
+    "сикалак",
+    "сикаман",
+    "сикасизми",
+    "сикей",
+    "сикиш",
+    "сикишаман",
+    "сикишамиз",
+    "сикишиш",
+    "скай",
+    "скаман",
+    "скасизми",
+    "скей",
+    "скейсикиш",
+    "ский",
+    "скишаман",
+    "скишамиз",
+    "скишамизми?",
+    "соска",
+    "сука",
+    "сукалар",
+    "ташак",
+    "ташаклар",
+    "ташақ",
+    "ташақлар",
+    "тошок",
+    "тошоқ",
+    "тошоқлар",
+    "факёу",
+    "фохиша",
+    "фохишалар",
+    "фохишамисан?",
+    "фохишасан",
+    "фоҳиша",
+    "фоҳишалар",
+    "фоҳишамисан?",
+    "фоҳишасан",
+    "фуcк",
+    "фуcкёу",
+    "хароми",
+    "хорамилар",
+    "хороми",
+    "хоромилар",
+    "хуй",
+    "хуйна",
+    "хурамилар",
+    "чочақ",
+    "чочоқ",
+    "ғар",
+    "қанжик",
+    "қанжиқ",
+    "қанжиқлар",
+    "қанжиқсан",
+    "қонжиқ",
+    "қотагим",
+    "қотағим",
+    "қотақ",
+    "қотақлар",
+    "қотақмисан",
+    "қотақсан",
+    "қотақхор",
+    "қотоглар",
+    "қотоқлар",
+    "қўтағим",
+    "қўтақ",
+    "қўтақхўр",
+    "қўтоғлар",
+    "қўтоқлар",
+    "ҳароми",
+    "ҳаромилар",
+    "ҳороми",
+    "ҳоромилар",
+    "ҳуй",
+    "ҳуйгами",
+    "ҳуйимга",
 }
 
+# Game/inline reklama kalit so'zlar/domenlar
+SUSPECT_KEYWORDS = {"open game", "play", "играть", "открыть игру", "game", "cattea", "gamee", "hamster", "notcoin", "tap to earn", "earn", "clicker"}
+SUSPECT_DOMAINS = {"cattea", "gamee", "hamster", "notcoin", "tgme", "t.me/gamee", "textra.fun", "ton"}
 
-def _t(lang: str, key: str, **kwargs) -> str:
-    d = TEXT.get(key) or {}
-    s = d.get(lang) or d.get(LANG_UZ) or key
-    if kwargs:
+# ----------- DM (Postgres-backed) -----------
+SUB_USERS_FILE = "subs_users.json"  # fallback/migration manbasi
+
+OWNER_IDS = {165553982}
+
+def is_owner(update: Update) -> bool:
+    u = update.effective_user
+    return bool(u and u.id in OWNER_IDS)
+
+# Postgres connection pool
+DB_POOL: Optional["asyncpg.Pool"] = None
+
+def _get_db_url() -> Optional[str]:
+    return (
+        os.getenv("DATABASE_URL")
+        or os.getenv("INTERNAL_DATABASE_URL")
+        or os.getenv("DATABASE_INTERNAL_URL")
+        or os.getenv("DB_URL")
+    )
+
+async def init_db(app=None):
+    """Create asyncpg pool and ensure tables exist. Also migrate JSON -> DB once."""
+    global DB_POOL
+    db_url = _get_db_url()
+    if not db_url:
+        log.warning("DATABASE_URL topilmadi; DM ro'yxati JSON faylga yoziladi (ephemeral).")
+        return
+    if asyncpg is None:
+        log.error("asyncpg o'rnatilmagan. requirements.txt ga 'asyncpg' qo'shing.")
+        return
+    # Railway/Render kabi PaaS larda Postgres ko'pincha SSL talab qiladi.
+    # asyncpg uchun SSL konteksti beramiz. (Mahalliy DB ham odatda muammo qilmaydi.)
+    ssl_ctx = ssl.create_default_context()
+    # Railway ba'zan `postgres://` beradi; moslik uchun sxemani normalizatsiya qilamiz.
+    if db_url.startswith("postgres://"):
+        db_url = "postgresql://" + db_url[len("postgres://"):]
+    # asyncpg SSL'ni `ssl=` orqali boshqaradi; dsn ichidagi sslmode parametrlari ba'zan muammo qiladi.
+    try:
+        u = urlparse(db_url)
+        qs = dict(parse_qsl(u.query, keep_blank_values=True))
+        for k in list(qs.keys()):
+            if k.lower() in ("sslmode", "sslrootcert", "sslcert", "sslkey"):
+                qs.pop(k, None)
+        db_url = urlunparse(u._replace(query=urlencode(qs)))
+    except Exception:
+        pass
+    # Ba'zi PaaS/DB (ayniqsa Render free) birinchi ulanishda connection'ni yopib yuborishi mumkin.
+    # Shuning uchun retry/backoff bilan pool ochamiz.
+    DB_POOL = None
+    for attempt in range(1, 6):
         try:
-            return s.format(**kwargs)
-        except Exception:
-            return s
-    return s
+            DB_POOL = await asyncpg.create_pool(
+                dsn=db_url,
+                min_size=1,
+                max_size=5,
+                ssl=(False if (urlparse(db_url).hostname or '').endswith('.railway.internal') else ssl_ctx),
+                timeout=30,
+                max_inactive_connection_lifetime=300,
+            )
+            log.info("Postgres DB_POOL ochildi (attempt=%s).", attempt)
+            break
+        except Exception as e:
+            log.warning("Postgres ulanish xatosi (attempt=%s/5): %r", attempt, e)
+            # exponential backoff: 1,2,4,8,16 (max 16s)
+            await asyncio.sleep(min(2 ** (attempt - 1), 16))
+    if DB_POOL is None:
+        log.error("Postgres'ga ulanib bo'lmadi. DB funksiyalar vaqtincha o'chadi; bot ishlashda davom etadi.")
+        return
 
-
-# ---------------------------- User storage (DB + fallback JSON) ----------------------------
-
-def _json_load(path: Path, default: Any) -> Any:
-    if path.exists():
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            return default
-    return default
-
-def _json_save(path: Path, data: Any) -> None:
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-
-def _load_users_json() -> Dict[str, Any]:
-    """
-    Supports both formats:
-      - old: [123,456]
-      - new: {"users":[123,456]}
-    """
-    raw = _json_load(USERS_FILE, {"users": []})
-    if isinstance(raw, list):
-        return {"users": raw}
-    if isinstance(raw, dict):
-        users = raw.get("users")
-        if not isinstance(users, list):
-            raw["users"] = []
-        return raw
-    return {"users": []}
-
-def _add_user_json(user_id: int) -> None:
-    data = _load_users_json()
-    users = set(int(x) for x in (data.get("users") or []) if str(x).isdigit())
-    users.add(int(user_id))
-    data["users"] = sorted(users)
-    _json_save(USERS_FILE, data)
-
-def _get_users_json() -> List[int]:
-    data = _load_users_json()
-    return [int(x) for x in (data.get("users") or []) if str(x).isdigit()]
-
-def _load_prefs_json() -> Dict[str, Any]:
-    raw = _json_load(PREFS_FILE, {})
-    return raw if isinstance(raw, dict) else {}
-
-def _set_lang_json(user_id: int, lang: str) -> None:
-    prefs = _load_prefs_json()
-    prefs[str(int(user_id))] = lang
-    _json_save(PREFS_FILE, prefs)
-
-def _get_lang_json(user_id: int) -> Optional[str]:
-    prefs = _load_prefs_json()
-    v = prefs.get(str(int(user_id)))
-    return v if v in (LANG_UZ, LANG_RU) else None
-
-
-class UserStore:
-    def __init__(self) -> None:
-        self.pool: Optional["asyncpg.pool.Pool"] = None
-
-    async def init(self) -> None:
-        if not DATABASE_URL or asyncpg is None:
-            if not DATABASE_URL:
-                log.warning("DATABASE_URL topilmadi — fallback: users.json ishlatiladi (cloud серверда тавсия этилмайди).")
-            else:
-                log.warning("asyncpg import bo'lmadi — fallback: users.json ishlatiladi.")
-            return
-
-        ssl_opt: Optional[bool] = None
-        if "sslmode=require" in DATABASE_URL.lower() or (os.getenv("PGSSLMODE") or "").lower() == "require":
-            ssl_opt = True
-
-        self.pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5, ssl=ssl_opt)
-        await self.pool.execute(
+    async with DB_POOL.acquire() as con:
+        await con.execute(
             """
-            CREATE TABLE IF NOT EXISTS bot_users (
-              user_id    BIGINT PRIMARY KEY,
-              first_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-              last_seen  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-              lang       TEXT NOT NULL DEFAULT 'uz',
-              username   TEXT,
-              first_name TEXT,
-              last_name  TEXT
+            CREATE TABLE IF NOT EXISTS dm_users (
+                user_id BIGINT PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                is_bot BOOLEAN DEFAULT FALSE,
+                language_code TEXT,
+                last_seen TIMESTAMPTZ DEFAULT now()
             );
             """
         )
-        await self.pool.execute("CREATE INDEX IF NOT EXISTS bot_users_last_seen_idx ON bot_users(last_seen);")
-        log.info("DB tayyor: bot_users jadvali tekshirildi/yaratildi.")
-
-    async def close(self) -> None:
-        if self.pool:
-            await self.pool.close()
-            self.pool = None
-
-    async def touch_user(self, user: User, lang: Optional[str] = None) -> None:
-        """Insert/update user. lang berilsa — yangilanadi; berilmasa — avvalgisi saqlanadi."""
-        uid = int(user.id)
-        if self.pool:
-            await self.pool.execute(
-                """
-                INSERT INTO bot_users (user_id, username, first_name, last_name, last_seen, lang)
-                VALUES ($1, $2, $3, $4, NOW(), COALESCE($5, 'uz'))
-                ON CONFLICT (user_id) DO UPDATE SET
-                  username   = EXCLUDED.username,
-                  first_name = EXCLUDED.first_name,
-                  last_name  = EXCLUDED.last_name,
-                  last_seen  = NOW(),
-                  lang       = COALESCE($5, bot_users.lang);
-                """,
-                uid,
-                getattr(user, "username", None),
-                getattr(user, "first_name", None),
-                getattr(user, "last_name", None),
-                lang,
-            )
-        else:
-            _add_user_json(uid)
-            if lang in (LANG_UZ, LANG_RU):
-                _set_lang_json(uid, lang)
-
-    async def set_lang(self, user: User, lang: str) -> None:
-        uid = int(user.id)
-        if self.pool:
-            await self.pool.execute(
-                """
-                INSERT INTO bot_users (user_id, username, first_name, last_name, last_seen, lang)
-                VALUES ($1, $2, $3, $4, NOW(), $5)
-                ON CONFLICT (user_id) DO UPDATE SET
-                  username   = EXCLUDED.username,
-                  first_name = EXCLUDED.first_name,
-                  last_name  = EXCLUDED.last_name,
-                  last_seen  = NOW(),
-                  lang       = EXCLUDED.lang;
-                """,
-                uid,
-                getattr(user, "username", None),
-                getattr(user, "first_name", None),
-                getattr(user, "last_name", None),
-                lang,
-            )
-        else:
-            _add_user_json(uid)
-            _set_lang_json(uid, lang)
-
-    async def get_lang(self, user_id: int) -> str:
-        uid = int(user_id)
-        if self.pool:
-            row = await self.pool.fetchrow("SELECT lang FROM bot_users WHERE user_id=$1", uid)
-            lang = (row["lang"] if row else None)  # type: ignore[index]
-            return lang if lang in (LANG_UZ, LANG_RU) else LANG_UZ
-        v = _get_lang_json(uid)
-        return v if v in (LANG_UZ, LANG_RU) else LANG_UZ
-
-    async def get_users(self) -> List[int]:
-        if self.pool:
-            rows = await self.pool.fetch("SELECT user_id FROM bot_users")
-            return [int(r["user_id"]) for r in rows]  # type: ignore[index]
-        return _get_users_json()
-
-
-STORE = UserStore()
-
-
-async def get_user_lang(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
-    """Lang priority: context.user_data -> DB/JSON -> default uz"""
-    uid = update.effective_user.id if update.effective_user else None
-    if not uid:
-        return LANG_UZ
-    cached = context.user_data.get("lang")
-    if cached in (LANG_UZ, LANG_RU):
-        return cached
-    lang = await STORE.get_lang(uid)
-    context.user_data["lang"] = lang
-    return lang
-
-
-# ---------------------------- Utils ----------------------------
-
-URL_RE = re.compile(r"(https?://[^\s]+)", re.IGNORECASE)
-
-def extract_first_url(text: str) -> Optional[str]:
-    if not text:
-        return None
-    m = URL_RE.search(text)
-    if not m:
-        return None
-    return m.group(1).strip().rstrip(").,!?;\"'")
-
-def is_youtube(url: str) -> bool:
-    u = url.lower()
-    return ("youtube.com" in u) or ("youtu.be" in u)
-
-def human_mb(num_bytes: Optional[int]) -> Optional[str]:
-    if not num_bytes or num_bytes <= 0:
-        return None
-    return f"{num_bytes / (1024 * 1024):.1f}MB"
-
-
-def human_mb_compact(num_bytes: Optional[int]) -> Optional[str]:
-    if not num_bytes or num_bytes <= 0:
-        return None
-    mb = num_bytes / (1024 * 1024)
-    if mb >= 10:
-        return f"{mb:.0f}MB"
-    return f"{mb:.1f}MB"
-
-def human_duration(seconds: Optional[float]) -> str:
-    if not seconds or seconds <= 0:
-        return "-"
-    s = int(seconds)
-    h = s // 3600
-    m = (s % 3600) // 60
-    ss = s % 60
-    if h > 0:
-        return f"{h:d}:{m:02d}:{ss:02d}"
-    return f"{m:d}:{ss:02d}"
-
-def is_tiktok(url: str) -> bool:
-    return "tiktok.com" in (url or "").lower()
-
-def is_tiktok_photo(url: str) -> bool:
-    u = (url or "").lower()
-    return ("tiktok.com" in u) and ("/photo/" in u)
-
-
-def _strip_query(url: str) -> str:
-    """Remove query params/fragments for more stable matching."""
+    # Ensure per-group tables exist
     try:
-        parts = urlsplit(url)
-        return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
-    except Exception:
-        return url
+        await init_group_db()
+    except Exception as e:
+        log.warning("init_group_db xatolik: %s", e)
 
-
-def _resolve_final_url(url: str, timeout: float = 6.0) -> str:
-    """Follow redirects (useful for vt.tiktok.com short links)."""
+    # Migrate from JSON (best-effort, only if DB empty)
     try:
-        req = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            final = getattr(resp, "geturl", lambda: url)()
-            return final or url
-    except Exception:
-        return url
+        if DB_POOL:
+            async with DB_POOL.acquire() as con:
+                count_row = await con.fetchval("SELECT COUNT(*) FROM dm_users;")
+            if count_row == 0 and os.path.exists(SUB_USERS_FILE):
+                s = _load_ids(SUB_USERS_FILE)
+                if s:
+                    async with DB_POOL.acquire() as con:
+                        async with con.transaction():
+                            for cid in s:
+                                try:
+                                    cid_int = int(cid)
+                                except Exception:
+                                    continue
+                                await con.execute(
+                                    "INSERT INTO dm_users (user_id) VALUES ($1) ON CONFLICT DO NOTHING;", cid_int
+                                )
+                    log.info(f"Migratsiya: JSON dan Postgresga {len(s)} ta ID import qilindi.")
+    except Exception as e:
+        log.warning(f"Migratsiya vaqtida xato: {e}")
 
-def _estimate_bytes_from_kbps(kbps: Optional[float], duration_s: Optional[float]) -> int:
-    if not kbps or not duration_s or kbps <= 0 or duration_s <= 0:
-        return 0
-    # kbps -> bytes
-    return int((kbps * 1000 / 8) * duration_s)
-
-def _best_audio_size_bytes(info: Dict[str, Any]) -> int:
-    formats = info.get("formats") or []
-    dur = info.get("duration")
-    auds = [f for f in formats if f.get("vcodec") == "none" and f.get("acodec") != "none"]
-    if not auds:
-        return 0
-
-    def score(a: Dict[str, Any]) -> Tuple[float, int]:
-        abr = float(a.get("abr") or 0.0)
-        tbr = float(a.get("tbr") or 0.0)
-        # prefer m4a, then higher bitrate
-        ext = (a.get("ext") or "").lower()
-        ext_score = 2 if ext == "m4a" else (1 if ext in ("mp4", "aac") else 0)
-        return (ext_score * 1000 + max(abr, tbr), int(a.get("filesize") or a.get("filesize_approx") or 0))
-
-    best = sorted(auds, key=score, reverse=True)[0]
-    sz = int(best.get("filesize") or best.get("filesize_approx") or 0)
-    if sz > 0:
-        return sz
-    kbps = float(best.get("tbr") or best.get("abr") or 0.0)
-    return _estimate_bytes_from_kbps(kbps, dur)
-
-
-def _best_video_format_under_height(info: Dict[str, Any], hmax: int) -> Optional[Dict[str, Any]]:
-    """YouTube форматларидан height<=hmax бўлган энг яхши видео форматни топади (аудиосиз видео стримлар)."""
-    formats = info.get("formats") or []
-    vids: List[Dict[str, Any]] = []
-    for f in formats:
+async def dm_upsert_user(user):
+    """Add/update a user to dm_users (Postgres if available, else JSON)."""
+    global DB_POOL
+    if user is None:
+        return
+    if DB_POOL:
         try:
-            if f.get("vcodec") == "none":
-                continue
-            h = int(f.get("height") or 0)
-            if h <= 0 or h > hmax:
-                continue
-            vids.append(f)
+            async with DB_POOL.acquire() as con:
+                await con.execute(
+                    """
+                    INSERT INTO dm_users (user_id, username, first_name, last_name, is_bot, language_code, last_seen)
+                    VALUES ($1,$2,$3,$4,$5,$6, now())
+                    ON CONFLICT (user_id) DO UPDATE SET
+                        username=EXCLUDED.username,
+                        first_name=EXCLUDED.first_name,
+                        last_name=EXCLUDED.last_name,
+                        is_bot=EXCLUDED.is_bot,
+                        language_code=EXCLUDED.language_code,
+                        last_seen=now();
+                    """,
+                    user.id, user.username, user.first_name, user.last_name, user.is_bot, getattr(user, "language_code", None)
+                )
+        except Exception as e:
+            log.warning(f"dm_upsert_user(DB) xatolik: {e}")
+    else:
+        # Fallback to JSON
+        add_chat_to_subs_fallback(user)
+
+async def dm_all_ids() -> List[int]:
+    global DB_POOL
+    if DB_POOL:
+        try:
+            async with DB_POOL.acquire() as con:
+                rows = await con.fetch("SELECT user_id FROM dm_users;")
+            return [r["user_id"] for r in rows]
+        except Exception as e:
+            log.warning(f"dm_all_ids(DB) xatolik: {e}")
+            return []
+    else:
+        return list(_load_ids(SUB_USERS_FILE))
+
+async def dm_remove_user(user_id: int):
+    global DB_POOL
+    if DB_POOL:
+        try:
+            async with DB_POOL.acquire() as con:
+                await con.execute("DELETE FROM dm_users WHERE user_id=$1;", user_id)
+        except Exception as e:
+            log.warning(f"dm_remove_user(DB) xatolik: {e}")
+    else:
+        remove_chat_from_subs_fallback(user_id)
+
+
+# ----------- Fallback JSON helpers (only used if DB not available) -----------
+def _load_ids(path: str):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return set(json.load(f))
+    except Exception:
+        return set()
+
+def _save_ids(path: str, data: set):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(sorted(list(data)), f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        try:
+            log.warning(f"IDs saqlashda xatolik: {e}")
         except Exception:
-            continue
-    if not vids:
-        return None
+            print(f"IDs saqlashda xatolik: {e}")
 
-    def score(v: Dict[str, Any]):
-        ext = (v.get("ext") or "").lower()
-        ext_score = 2 if ext == "mp4" else (1 if ext in ("webm", "mkv") else 0)
-        tbr = float(v.get("tbr") or 0.0)
-        vbr = float(v.get("vbr") or 0.0)
-        h = int(v.get("height") or 0)
-        return (ext_score, h, max(tbr, vbr))
+def add_chat_to_subs_fallback(user_or_chat):
+    s = _load_ids(SUB_USERS_FILE)
+    # user_or_chat is User in our call sites
+    cid = getattr(user_or_chat, "id", None)
+    if cid is not None:
+        s.add(cid)
+        _save_ids(SUB_USERS_FILE, s)
+    return "user"
 
-    return sorted(vids, key=score, reverse=True)[0]
-
-def _video_total_size_bytes(info: Dict[str, Any], f: Dict[str, Any]) -> int:
-    dur = info.get("duration")
-    sz = int(f.get("filesize") or f.get("filesize_approx") or 0)
-    if sz <= 0:
-        kbps = float(f.get("tbr") or 0.0)
-        sz = _estimate_bytes_from_kbps(kbps, dur)
-    # If this format has no audio, add best audio size for display
-    if (f.get("acodec") == "none") or not f.get("acodec"):
-        sz += _best_audio_size_bytes(info)
-    return sz
-
-def _pick_best_thumbnail_url(info: Dict[str, Any]) -> Optional[str]:
-    # yt-dlp may provide 'thumbnail' and list 'thumbnails'
-    t = info.get("thumbnail")
-    if t:
-        return t
-    thumbs = info.get("thumbnails") or []
-    if not thumbs:
-        return None
-    # pick biggest by width/height if present
-    def score(x: Dict[str, Any]) -> Tuple[int, int]:
-        return (int(x.get("width") or 0), int(x.get("height") or 0))
-    best = sorted(thumbs, key=score, reverse=True)[0]
-    return best.get("url")
+def remove_chat_from_subs_fallback(user_id: int):
+    s = _load_ids(SUB_USERS_FILE)
+    if user_id in s:
+        s.remove(user_id)
+        _save_ids(SUB_USERS_FILE, s)
+    return "user"
 
 
-def _cache_put(payload: Dict[str, Any]) -> str:
-    token = secrets.token_urlsafe(8)[:10]
-    if len(CALLBACK_CACHE) >= CALLBACK_CACHE_MAX:
-        for k in list(CALLBACK_CACHE.keys())[: CALLBACK_CACHE_MAX // 2]:
-            CALLBACK_CACHE.pop(k, None)
-    CALLBACK_CACHE[token] = payload
-    return token
+# ----------- Privilege/Admin helpers -----------
+async def is_admin(update: Update) -> bool:
+    chat = update.effective_chat
+    msg = update.effective_message
+    user = update.effective_user
+    if not chat:
+        return False
+    try:
+        # Anonymous admin (message on behalf of the group itself)
+        if msg and getattr(msg, "sender_chat", None):
+            sc = msg.sender_chat
+            if sc.id == chat.id:
+                return True
+            # Linked channel posting into a supergroup
+            linked_id = getattr(chat, "linked_chat_id", None)
+            if linked_id and sc.id == linked_id:
+                return True
+        # Regular user-based admin check
+        if user:
+            member = await update.get_bot().get_chat_member(chat.id, user.id)
+            return member.status in ("administrator", "creator", "owner")
+        return False
+    except Exception as e:
+        log.warning(f"is_admin tekshiruvda xatolik: {e}")
+        return False
 
-def _cache_get(token: str) -> Optional[Dict[str, Any]]:
-    return CALLBACK_CACHE.get(token)
+async def is_privileged_message(msg, bot) -> bool:
+    """Adminlar, creatorlar yoki guruh/linked kanal nomidan yozilgan (sender_chat) xabarlar uchun True."""
+    try:
+        chat = msg.chat
+        user = msg.from_user
+        # Anonymous admin (group) yoki linked kanal
+        if getattr(msg, "sender_chat", None):
+            sc = msg.sender_chat
+            if sc.id == chat.id:
+                return True
+            linked_id = getattr(chat, "linked_chat_id", None)
+            if linked_id and sc.id == linked_id:
+                return True
+        # Odatdagi admin/creator
+        if user:
+            member = await bot.get_chat_member(chat.id, user.id)
+            if member.status in ("administrator", "creator", "owner"):
+                return True
+    except Exception as e:
+        log.warning(f"is_privileged_message xatolik: {e}")
+    return False
+
+async def kanal_tekshir(user_id: int, bot) -> bool:
+    global KANAL_USERNAME
+    if not KANAL_USERNAME:
+        return True
+    try:
+        member = await bot.get_chat_member(KANAL_USERNAME, user_id)
+        return member.status in ("member", "creator", "administrator")
+    except Exception as e:
+        log.warning(f"kanal_tekshir xatolik: {e}")
+        return False
+
+def matndan_sozlar_olish(matn: str):
+    return re.findall(r"\b\w+\b", (matn or "").lower())
+
+def admin_add_link(bot_username: str) -> str:
+    rights = [
+        'delete_messages','restrict_members','invite_users',
+        'pin_messages','manage_topics','manage_video_chats','manage_chat'
+    ]
+    rights_param = '+'.join(rights)
+    return f"https://t.me/{bot_username}?startgroup&admin={rights_param}"
+
+def add_to_group_kb(bot_username: str):
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("➕ Guruhga qo‘shish", url=admin_add_link(bot_username))]]
+    )
+
+def has_suspicious_buttons(msg) -> bool:
+    try:
+        kb = msg.reply_markup.inline_keyboard if msg.reply_markup else []
+        for row in kb:
+            for btn in row:
+                if getattr(btn, "callback_game", None) is not None:
+                    return True
+                u = getattr(btn, "url", "") or ""
+                if u:
+                    low = u.lower()
+                    if any(dom in low for dom in SUSPECT_DOMAINS) or any(x in low for x in ("game", "play", "tgme")):
+                        return True
+                wa = getattr(btn, "web_app", None)
+                if wa and getattr(wa, "url", None):
+                    if any(dom in wa.url.lower() for dom in SUSPECT_DOMAINS):
+                        return True
+        return False
+    except Exception:
+        return False
 
 
-def _friendly_ydl_error(e: Exception, lang: str) -> str:
-    """Minimal, user-friendly error text for logs from yt-dlp / download."""
-    s = str(e)
-    s_low = s.lower()
+# ---------------------- Commands ----------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Auto-subscribe: /start bosgan foydalanuvchini DM ro'yxatiga qo'shamiz (DB)
+    try:
+        if update.effective_chat.type == 'private':
+            await dm_upsert_user(update.effective_user)
+    except Exception as e:
+        log.warning(f"/start dm_upsert_user xatolik: {e}")
+    kb = [[InlineKeyboardButton("➕ Guruhga qo‘shish", url=admin_add_link(context.bot.username))]]
+    await update.effective_message.reply_text(
+        "<b>САЛОМ👋</b>\n"
+        "Мен барча рекламаларни, ссилкалани ва кирди чиқди хабарларни ҳамда ёрдамчи ботлардан келган рекламаларни гуруҳлардан <b>ўчириб</b> <b>тураман</b>\n\n"
+        "Профилингиз <b>ID</b> гизни аниқлаб бераман\n\n"
+        "Мажбурий гурухга одам қўштираман ва каналга аъзо бўлдираман (қўшмаса ёзолмайди) ➕\n\n"
+        "18+ уятли сўзларни ўчираман ва бошқа кўплаб ёрдамлар бераман 👨🏻‍✈\n\n"
+        "Ботнинг ўзи ҳам хечқандай реклама ёки ҳаволалар <b>ТАРҚАТМАЙДИ</b> ⛔\n\n"
+        "Бот командалари <b>қўлланмаси</b> 👉 /help\n\n"
+        "Фақат ишлашим учун гуруҳингизга қўшиб, <b>ADMIN</b> <b>беришингиз</b> <b>керак</b> 🙂\n\n"
+        "Мурожаат ва саволлар бўлса 👉 @SOAuz_admin \n\n"
+        "Сиздан фақатгина хомий каналимизга аъзолик 👉 <b>@SOAuz</b>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
 
-    # YouTube bot-check patterns
-    if "sign in to confirm you’re not a bot" in s_low or "confirm you’re not a bot" in s_low:
-        # Cookies bor-yo‘qligini taxmin qilamiz
-        if (os.getenv("YT_COOKIES_B64") or os.getenv("YT_COOKIES_FILE")):
-            return _t(lang, "yt_botcheck_even_with_cookies")
-        return _t(lang, "yt_need_cookies")
+async def help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "📌 <b>БОТ ҚЎЛЛАНМАЛАРИ</b>\n\n"
+        "🔹 <b>/id</b> - Аккаунтингиз ID сини кўрсатади.\n\n"
+        "📘<b>ЁРДАМЧИ БУЙРУҚЛАР</b>\n"
+        "🔹 <b>/tun</b> — Тун режими(шу дақиқадан гурухга ёзилган хабарлар автоматик ўчирилиб турилади).\n"
+        "🔹 <b>/tunoff</b> — Тун режимини ўчириш.\n"
+        "🔹 <b>/ruxsat</b> — (Ответит) орқали имтиёз бериш.\n\n"
+        "👥<b>ГУРУХГА МАЖБУР ОДАМ ҚЎШТИРИШ ВА КАНАЛГА МАЖБУР АЪЗО БЎЛДИРИШ</b>\n"
+        "🔹 <b>/kanal @kanal1 @kanal2</b> — Мажбурий кўрсатилган каналга аъзо қилдириш.\n"
+        "🔹 <b>/kanaloff</b> — Мажбурий каналга аъзони ўчириш.\n"
+        "🔹 <b>/majbur [3–25]</b> — Гурухда мажбурий одам қўшишни ёқиш.\n"
+        "🔹 <b>/majburoff</b> — Мажбурий қўшишни ўчириш.\n\n"
+        "📈<b>ОДАМ ҚЎШГАНЛАРНИ ХИСОБЛАШ</b>\n"
+        "🔹 <b>/top</b> — TOP одам қўшганлар.\n"
+        "🔹 <b>/cleangroup</b> — Одам қўшганлар хисобини 0 қилиш.\n"
+        "🔹 <b>/count</b> — Ўзингиз нечта қўшдингиз.\n"
+        "🔹 <b>/replycount</b> — (Ответит) қилинган одам қўшганлар сони.\n"
+        "🔹 <b>/cleanuser</b> — (Ответит) қилинган одам қўшган хисобини 0 қилиш.\n"
+    )
+    await update.effective_message.reply_text(text, parse_mode="HTML", disable_web_page_preview=True)
 
-    # 403 Forbidden (ko‘pincha YouTube cloud/IP blok)
-    if "http error 403" in s_low or "403 forbidden" in s_low:
-        return _t(lang, "yt_403")
+async def id_berish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private":
+        return
+    user = update.effective_user
+    await update.effective_message.reply_text(f"🆔 {user.first_name}, sizning Telegram ID’ingiz: {user.id}")
 
-    if "unsupported url" in s_low:
-        return s
+async def tun(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global TUN_REJIMI
+    if not await is_admin(update):
+        return await update.effective_message.reply_text("⛔ Faqat adminlar.")
+    TUN_REJIMI = True
+    await update.effective_message.reply_text("🌙 Tun rejimi yoqildi. Oddiy foydalanuvchi xabarlari o‘chiriladi.")
 
-    if "filename too long" in s_low:
-        return _t(lang, "err_filename_too_long")
+async def tunoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global TUN_REJIMI
+    if not await is_admin(update):
+        return await update.effective_message.reply_text("⛔ Faqat adminlar.")
+    TUN_REJIMI = False
+    await update.effective_message.reply_text("🌞 Tun rejimi o‘chirildi.")
 
-    # Default: qisqa qilib qaytaramiz
-    if len(s) > 250:
-        s = s[:247] + "..."
-    return s
+async def ruxsat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update):
+        return await update.effective_message.reply_text("⛔ Faqat adminlar.")
+    if not update.effective_message.reply_to_message:
+        return await update.effective_message.reply_text("Iltimos, foydalanuvchi xabariga reply qiling.")
+    uid = update.effective_message.reply_to_message.from_user.id
+    RUXSAT_USER_IDS.add(uid)
+    await update.effective_message.reply_text(f"✅ <code>{uid}</code> foydalanuvchiga ruxsat berildi.", parse_mode="HTML")
 
+async def kanal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update):
+        return await update.effective_message.reply_text("⛔ Faqat adminlar.")
+    global KANAL_USERNAME
+    if context.args:
+        KANAL_USERNAME = context.args[0]
+        await update.effective_message.reply_text(f"📢 Majburiy kanal: {KANAL_USERNAME}")
+    else:
+        await update.effective_message.reply_text("Namuna: /kanal @username")
 
+async def kanaloff(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update):
+        return await update.effective_message.reply_text("⛔ Faqat adminlar.")
+    global KANAL_USERNAME
+    KANAL_USERNAME = None
+    await update.effective_message.reply_text("🚫 Majburiy kanal talabi o‘chirildi.")
 
+def majbur_klaviatura():
+    rows = [[3, 5, 7, 10, 12], [15, 18, 20, 25, 30]]
+    keyboard = [[InlineKeyboardButton(str(n), callback_data=f"set_limit:{n}") for n in row] for row in rows]
+    keyboard.append([InlineKeyboardButton("❌ BEKOR QILISH ❌", callback_data="set_limit:cancel")])
+    return InlineKeyboardMarkup(keyboard)
 
-# ---------------------------- yt-dlp cookies helpers ----------------------------
-
-_COOKIEFILE_PATH: Optional[str] = None
-_COOKIE_LOGGED: bool = False
-
-def _ensure_cookiefile(workdir: Optional[str] = None) -> Optional[str]:
-    """Prepare a **writable** cookies.txt for yt-dlp and return its path.
-
-    Important: do NOT reuse the same temp cookies path across concurrent requests.
-    yt-dlp may update cookies on exit, and parallel runs can corrupt a shared file.
-    So we create a fresh temp file per call.
-
-    Sources:
-    - YT_COOKIES_B64: base64 of cookies.txt
-    - YT_COOKIES_FILE: path to cookies.txt (e.g. /etc/secrets/cookies.txt)
-    """
-    def _dst_path() -> str:
-        base_dir = workdir if workdir else tempfile.gettempdir()
-        os.makedirs(base_dir, exist_ok=True)
-        return os.path.join(base_dir, f"yt_cookies_{uuid.uuid4().hex}.txt")
-
-    def _warn_if_suspicious(path: str) -> None:
+async def majbur(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update):
+        return await update.effective_message.reply_text("⛔ Faqat adminlar.")
+    global MAJBUR_LIMIT
+    if context.args:
         try:
-            sz = os.path.getsize(path)
-            if sz <= 0:
-                log.warning("YT cookies file is empty: %s", path)
+            val = int(context.args[0])
+            if not (3 <= val <= 30):
+                raise ValueError
+            MAJBUR_LIMIT = val
+            await update.effective_message.reply_text(
+                f"✅ Majburiy odam qo‘shish limiti: <b>{MAJBUR_LIMIT}</b>",
+                parse_mode="HTML"
+            )
+        except ValueError:
+            await update.effective_message.reply_text(
+                "❌ Noto‘g‘ri qiymat. Ruxsat etilgan oraliq: <b>3–30</b>. Masalan: <code>/majbur 10</code>",
+                parse_mode="HTML"
+            )
+    else:
+        await update.effective_message.reply_text(
+            "👥 Guruhda majburiy odam qo‘shishni nechta qilib belgilay? 👇\n"
+            "Qo‘shish shart emas — /majburoff",
+            reply_markup=majbur_klaviatura()
+        )
+
+async def on_set_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update):
+        return await update.callback_query.answer("Faqat adminlar!", show_alert=True)
+    q = update.callback_query
+    await q.answer()
+    data = q.data.split(":", 1)[1]
+    global MAJBUR_LIMIT
+    if data == "cancel":
+        return await q.edit_message_text("❌ Bekor qilindi.")
+    try:
+        val = int(data)
+        if not (3 <= val <= 30):
+            raise ValueError
+        MAJBUR_LIMIT = val
+        await q.edit_message_text(f"✅ Majburiy limit: <b>{MAJBUR_LIMIT}</b>", parse_mode="HTML")
+    except Exception:
+        await q.edit_message_text("❌ Noto‘g‘ri qiymat.")
+
+async def majburoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update):
+        return await update.effective_message.reply_text("⛔ Faqat adminlar.")
+    global MAJBUR_LIMIT
+    MAJBUR_LIMIT = 0
+    await update.effective_message.reply_text("🚫 Majburiy odam qo‘shish o‘chirildi.")
+
+async def top_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update):
+        return await update.effective_message.reply_text("⛔ Faqat adminlar.")
+    if not FOYDALANUVCHI_HISOBI:
+        return await update.effective_message.reply_text("Hali hech kim odam qo‘shmagan.")
+    items = sorted(FOYDALANUVCHI_HISOBI.items(), key=lambda x: x[1], reverse=True)[:100]
+    lines = ["🏆 <b>Eng ko‘p odam qo‘shganlar</b> (TOP 100):"]
+    for i, (uid, cnt) in enumerate(items, start=1):
+        lines.append(f"{i}. <code>{uid}</code> — {cnt} ta")
+    await update.effective_message.reply_text("\n".join(lines), parse_mode="HTML")
+
+async def cleangroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update):
+        return await update.effective_message.reply_text("⛔ Faqat adminlar.")
+    FOYDALANUVCHI_HISOBI.clear()
+    RUXSAT_USER_IDS.clear()
+    await update.effective_message.reply_text("🗑 Barcha foydalanuvchilar hisobi va imtiyozlar 0 qilindi.")
+
+async def count_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    cnt = FOYDALANUVCHI_HISOBI.get(uid, 0)
+    if MAJBUR_LIMIT > 0:
+        qoldi = max(MAJBUR_LIMIT - cnt, 0)
+        await update.effective_message.reply_text(f"📊 Siz {cnt} ta odam qo‘shgansiz. Qolgan: {qoldi} ta.")
+    else:
+        await update.effective_message.reply_text(f"📊 Siz {cnt} ta odam qo‘shgansiz. (Majburiy qo‘shish faol emas)")
+
+async def replycount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update):
+        return await update.effective_message.reply_text("⛔ Faqat adminlar.")
+    msg = update.effective_message
+    if not msg.reply_to_message:
+        return await msg.reply_text("Iltimos, kimning hisobini ko‘rmoqchi bo‘lsangiz o‘sha xabarga reply qiling.")
+    uid = msg.reply_to_message.from_user.id
+    cnt = FOYDALANUVCHI_HISOBI.get(uid, 0)
+    await msg.reply_text(f"👤 <code>{uid}</code> {cnt} ta odam qo‘shgan.", parse_mode="HTML")
+
+async def cleanuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update):
+        return await update.effective_message.reply_text("⛔ Faqat adminlar.")
+    msg = update.effective_message
+    if not msg.reply_to_message:
+        return await msg.reply_text("Iltimos, kimni 0 qilmoqchi bo‘lsangiz o‘sha foydalanuvchi xabariga reply qiling.")
+    uid = msg.reply_to_message.from_user.id
+    FOYDALANUVCHI_HISOBI[uid] = 0
+    RUXSAT_USER_IDS.discard(uid)
+    await msg.reply_text(f"🗑 <code>{uid}</code> foydalanuvchi hisobi 0 qilindi (imtiyoz o‘chirildi).", parse_mode="HTML")
+
+async def kanal_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    user_id = q.from_user.id
+    if not KANAL_USERNAME:
+        return await q.edit_message_text("⚠️ Kanal sozlanmagan.")
+    try:
+        member = await context.bot.get_chat_member(KANAL_USERNAME, user_id)
+        if member.status in ("member", "administrator", "creator"):
+            try:
+                await context.bot.restrict_chat_member(
+                    chat_id=q.message.chat.id,
+                    user_id=user_id,
+                    permissions=FULL_PERMS,
+                )
+            except Exception:
+                pass
+            await q.edit_message_text("✅ A’zo bo‘lganingiz tasdiqlandi. Endi guruhda yozishingiz mumkin.")
+        else:
+            await q.edit_message_text("❌ Hali kanalga a’zo emassiz.")
+    except Exception:
+        await q.edit_message_text("⚠️ Tekshirishda xatolik. Kanal username noto‘g‘ri yoki bot kanalga a’zo emas.")
+
+async def on_check_added(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    uid = q.from_user.id
+
+    data = q.data
+    if ":" in data:
+        try:
+            owner_id = int(data.split(":", 1)[1])
+        except ValueError:
+            owner_id = None
+        if owner_id and owner_id != uid:
+            return await q.answer("Bu tugma siz uchun emas!", show_alert=True)
+
+    cnt = FOYDALANUVCHI_HISOBI.get(uid, 0)
+
+    if uid in RUXSAT_USER_IDS or (MAJBUR_LIMIT > 0 and cnt >= MAJBUR_LIMIT):
+        try:
+            await context.bot.restrict_chat_member(
+                chat_id=q.message.chat.id,
+                user_id=uid,
+                permissions=FULL_PERMS,
+            )
+        except Exception:
+            pass
+        BLOK_VAQTLARI.pop((q.message.chat.id, uid), None)
+        return await q.edit_message_text("✅ Talab bajarilgan! Endi guruhda yozishingiz mumkin.")
+
+    qoldi = max(MAJBUR_LIMIT - cnt, 0)
+    return await q.answer(
+        f"❗ Siz hozirgacha {cnt} ta foydalanuvchi qo‘shdingiz va yana {qoldi} ta foydalanuvchi qo‘shishingiz kerak",
+        show_alert=True
+    )
+
+async def on_grant_priv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    chat = q.message.chat if q.message else None
+    user = q.from_user
+    if not (chat and user):
+        return await q.answer()
+    try:
+        member = await context.bot.get_chat_member(chat.id, user.id)
+        if member.status not in ("administrator", "creator"):
+            return await q.answer("Faqat adminlar imtiyoz bera oladi!", show_alert=True)
+    except Exception:
+        return await q.answer("Tekshirishda xatolik.", show_alert=True)
+    await q.answer()
+    try:
+        target_id = int(q.data.split(":", 1)[1])
+    except Exception:
+        return await q.edit_message_text("❌ Noto‘g‘ri ma'lumot.")
+    RUXSAT_USER_IDS.add(target_id)
+    await q.edit_message_text(f"🎟 <code>{target_id}</code> foydalanuvchiga imtiyoz berildi. Endi u yozishi mumkin.", parse_mode="HTML")
+
+
+# ---------------------- Filters ----------------------
+async def reklama_va_soz_filtri(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    # 🔒 Linked kanalning avtomatik forward postlari — teginmaymiz
+    try:
+        if await is_linked_channel_autoforward(msg, context.bot):
+            return
+    except Exception:
+        pass
+    if not msg or not msg.chat or not msg.from_user:
+        return
+    # Admin/creator/guruh nomidan xabarlar — teginmaymiz
+    if await is_privileged_message(msg, context.bot):
+        return
+    # Oq ro'yxat
+    if msg.from_user.id in WHITELIST or (msg.from_user.username and msg.from_user.username in WHITELIST):
+        return
+    # Tun rejimi
+    if TUN_REJIMI:
+        try:
+            await msg.delete()
+        except:
+            pass
+        return
+    # Kanal a'zoligi
+    if not await kanal_tekshir(msg.from_user.id, context.bot):
+        try:
+            await msg.delete()
+        except:
+            pass
+        kb = [
+            [InlineKeyboardButton("✅ Men a’zo bo‘ldim", callback_data=f"kanal_azo:{msg.from_user.id}")],
+            [InlineKeyboardButton("➕ Guruhga qo‘shish", url=admin_add_link(context.bot.username))]
+        ]
+        await context.bot.send_message(
+            chat_id=msg.chat_id,
+            text=f"⚠️ {msg.from_user.mention_html()}, siz {KANAL_USERNAME} kanalga a’zo emassiz!",
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode="HTML"
+        )
+        return
+
+    text = msg.text or msg.caption or ""
+    entities = msg.entities or msg.caption_entities or []
+
+    # Inline bot orqali kelgan xabar — ko'pincha game reklama
+    if getattr(msg, "via_bot", None):
+        try:
+            await msg.delete()
+        except:
+            pass
+        await context.bot.send_message(
+            chat_id=msg.chat_id,
+            text=f"⚠️ {msg.from_user.mention_html()}, yashirin ssilka yuborish taqiqlangan!",
+            reply_markup=add_to_group_kb(context.bot.username),
+            parse_mode="HTML"
+        )
+        return
+
+    # Tugmalarda game/web-app/URL bo'lsa — blok
+    if has_suspicious_buttons(msg):
+        try:
+            await msg.delete()
+        except:
+            pass
+        await context.bot.send_message(
+            chat_id=msg.chat_id,
+            text="⚠️ O‘yin/veb-app tugmali reklama taqiqlangan!",
+            reply_markup=add_to_group_kb(context.bot.username)
+        )
+        return
+
+    # Matndan o‘yin reklamasini aniqlash
+    low = text.lower()
+    if any(k in low for k in SUSPECT_KEYWORDS):
+        try:
+            await msg.delete()
+        except:
+            pass
+        await context.bot.send_message(
+            chat_id=msg.chat_id,
+            text="⚠️ O‘yin reklamalari taqiqlangan!",
+            reply_markup=add_to_group_kb(context.bot.username)
+        )
+        return
+
+    # Botlardan kelgan reklama/havola/game
+    if getattr(msg.from_user, "is_bot", False):
+        has_game = bool(getattr(msg, "game", None))
+        has_url_entity = any(ent.type in ("text_link", "url", "mention") for ent in entities)
+        has_url_text = any(x in low for x in ("t.me","telegram.me","http://","https://","www.","youtu.be","youtube.com"))
+        if has_game or has_url_entity or has_url_text:
+            try:
+                await msg.delete()
+            except:
+                pass
+            await context.bot.send_message(
+                chat_id=msg.chat_id,
+                text=f"⚠️ {msg.from_user.mention_html()}, reklama/ssilka yuborish taqiqlangan!",
+                reply_markup=add_to_group_kb(context.bot.username),
+                parse_mode="HTML"
+            )
+            return
+
+    # Yashirin yoki aniq ssilkalar
+    for ent in entities:
+        if ent.type in ("text_link", "url", "mention"):
+            url = getattr(ent, "url", "") or ""
+            if url and ("t.me" in url or "telegram.me" in url or "http://" in url or "https://" in url):
+                try:
+                    await msg.delete()
+                except:
+                    pass
+                await context.bot.send_message(
+                    chat_id=msg.chat_id,
+                    text=f"⚠️ {msg.from_user.mention_html()}, yashirin ssilka yuborish taqiqlangan!",
+                    reply_markup=add_to_group_kb(context.bot.username),
+                    parse_mode="HTML"
+                )
                 return
-            with open(path, "rb") as f:
-                head = f.read(256)
-            head_txt = head.decode("utf-8", errors="ignore").strip()
-            if head_txt and ("Netscape" not in head_txt) and ("# HTTP Cookie File" not in head_txt):
-                log.warning("YT cookies file may be in a non-Netscape format: %s", path)
+
+    if any(x in low for x in ("t.me","telegram.me","@","www.","https://youtu.be","http://","https://")):
+        try:
+            await msg.delete()
+        except:
+            pass
+        await context.bot.send_message(
+            chat_id=msg.chat_id,
+            text=f"⚠️ {msg.from_user.mention_html()}, reklama/ssilka yuborish taqiqlangan!",
+            reply_markup=add_to_group_kb(context.bot.username),
+            parse_mode="HTML"
+        )
+        return
+
+    # So'kinish
+    sozlar = matndan_sozlar_olish(text)
+    if any(s in UYATLI_SOZLAR for s in sozlar):
+        try:
+            await msg.delete()
+        except:
+            pass
+        await context.bot.send_message(
+            chat_id=msg.chat_id,
+            text=f"⚠️ {msg.from_user.mention_html()}, guruhda so‘kinish taqiqlangan!",
+            reply_markup=add_to_group_kb(context.bot.username),
+            parse_mode="HTML"
+        )
+        return
+
+# Yangi a'zolarni qo'shganlarni hisoblash hamda kirdi/chiqdi xabarlarni o'chirish
+async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    adder = msg.from_user
+    members = msg.new_chat_members or []
+    if not adder:
+        return
+    for m in members:
+        if adder.id != m.id:
+            FOYDALANUVCHI_HISOBI[adder.id] += 1
+    try:
+        await msg.delete()
+    except:
+        pass
+
+# Majburiy qo'shish filtri — yetmaganlarda 1 daqiqaga blok
+async def majbur_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if MAJBUR_LIMIT <= 0:
+        return
+    msg = update.effective_message
+    # 🔒 Linked kanalning avtomatik forward postlari — teginmaymiz
+    try:
+        if await is_linked_channel_autoforward(msg, context.bot):
+            return
+    except Exception:
+        pass
+    if not msg or not msg.from_user:
+        return
+    if await is_privileged_message(msg, context.bot):
+        return
+
+    uid = msg.from_user.id
+
+    # Agar foydalanuvchi hanuz blokda bo'lsa — xabarini o'chirib, hech narsa yubormaymiz
+    now = datetime.now(timezone.utc)
+    key = (msg.chat_id, uid)
+    until_old = BLOK_VAQTLARI.get(key)
+    if until_old and now < until_old:
+        try:
+            await msg.delete()
+        except:
+            pass
+        return
+    if uid in RUXSAT_USER_IDS:
+        return
+
+    cnt = FOYDALANUVCHI_HISOBI.get(uid, 0)
+    if cnt >= MAJBUR_LIMIT:
+        return
+
+    # Xabarni o'chiramiz
+    try:
+        await msg.delete()
+    except:
+        return
+
+    # 1 daqiqaga blok
+    until = datetime.now(timezone.utc) + timedelta(minutes=1)
+    BLOK_VAQTLARI[(msg.chat_id, uid)] = until
+    try:
+        await context.bot.restrict_chat_member(
+            chat_id=msg.chat_id,
+            user_id=uid,
+            permissions=BLOCK_PERMS,
+            until_date=until
+        )
+    except Exception as e:
+        log.warning(f"Restrict failed: {e}")
+
+    qoldi = max(MAJBUR_LIMIT - cnt, 0)
+    kb = [
+        [InlineKeyboardButton("✅ Odam qo‘shdim", callback_data=f"check_added:{uid}")],
+        [InlineKeyboardButton("🎟 Imtiyoz berish", callback_data=f"grant:{uid}")],
+        [InlineKeyboardButton("➕ Guruhga qo‘shish", url=admin_add_link(context.bot.username))],
+        [InlineKeyboardButton("⏳ 1 daqiqaga bloklandi", callback_data="noop")]
+    ]
+    await context.bot.send_message(
+        chat_id=msg.chat_id,
+        text=f"⚠️ Guruhda yozish uchun {MAJBUR_LIMIT} ta odam qo‘shishingiz kerak! Qolgan: {qoldi} ta.",
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
+
+
+# -------------- Bot my_status (admin emas) ogohlantirish --------------
+async def on_my_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        st = update.my_chat_member.new_chat_member.status
+    except Exception:
+        return
+    if st in (ChatMemberStatus.MEMBER, ChatMemberStatus.RESTRICTED):
+        me = await context.bot.get_me()
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton(
+            '🔐 Botni admin qilish', url=admin_add_link(me.username)
+        )]])
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=(
+                    '⚠️ Bot hozircha *admin emas*.\n'
+                    "Iltimos, pastdagi tugma orqali admin qiling, shunda barcha funksiyalar to'liq ishlaydi."
+                ),
+                reply_markup=kb,
+                parse_mode='Markdown'
+            )
         except Exception:
             pass
 
-    # 1) Base64 variant
-    b64 = (os.getenv("YT_COOKIES_B64") or "").strip()
-    if b64:
-        # If user pasted the PowerShell command instead of output, ignore.
-        if ("[Convert]::ToBase64String" in b64) or ("ReadAllBytes" in b64):
-            log.warning("YT_COOKIES_B64 qiymati base64 emas (buyruq matni ko‘rinadi). Uni o‘chirib tashlang yoki haqiqiy base64 natijani kiriting.")
-        else:
-            try:
-                import base64
-                clean = re.sub(r"\s+", "", b64)
-                # Fix missing padding
-                pad = (-len(clean)) % 4
-                if pad:
-                    clean += "=" * pad
-                data = base64.b64decode(clean.encode("ascii"), validate=False)
-                tmp_path = _dst_path()
-                with open(tmp_path, "wb") as f:
-                    f.write(data)
-                _warn_if_suspicious(tmp_path)
-                log.info("YT cookies (b64) tayyor: %s (exists=%s, size=%s)", tmp_path, os.path.exists(tmp_path), os.path.getsize(tmp_path))
-                return tmp_path
-            except Exception as e:
-                log.warning("YT_COOKIES_B64 decode xatosi: %s", e)
 
-    # 2) File path variant
-    src = (os.getenv("YT_COOKIES_FILE") or "").strip()
-    candidates: list[str] = []
-    if src:
-        candidates.append(src)
-        candidates.append(os.path.join("/etc/secrets", os.path.basename(src)))
-        candidates.append(os.path.basename(src))
-    candidates += ["/etc/secrets/cookies.txt", "/etc/secrets/Cookies.txt", "cookies.txt", "Cookies.txt"]
-
-    src_path = None
-    for p in candidates:
-        try:
-            if p and os.path.exists(p) and os.path.getsize(p) > 0:
-                src_path = p
-                break
-        except Exception:
-            continue
-
-    if not src_path:
-        if src:
-            log.warning("YT_COOKIES_FILE topildi, lekin fayl yo'q: %s", src)
-        return None
-
+# ---------------------- DM: Broadcast ----------------------
+async def track_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Har qanday PRIVATE chatdagi xabarni ko'rsak, u foydalanuvchini DBga upsert qilamiz."""
     try:
-        tmp_path = _dst_path()
-        shutil.copyfile(src_path, tmp_path)
-        _warn_if_suspicious(tmp_path)
-        log.info("YT cookies (file) tayyor: %s (exists=%s, size=%s, src=%s)", tmp_path, os.path.exists(tmp_path), os.path.getsize(tmp_path), src_path)
-        return tmp_path
+        await dm_upsert_user(update.effective_user)
     except Exception as e:
-        log.warning("YT cookies copy xatosi: %s", e)
-        return None
+        log.warning(f"track_private upsert xatolik: {e}")
 
+async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """(OWNER & DM) Matnni barcha DM obunachilarga yuborish."""
+    if update.effective_chat.type != "private":
+        return await update.effective_message.reply_text("⛔ Bu buyruq faqat DM (shaxsiy chat)da ishlaydi.")
+    if not is_owner(update):
+        return await update.effective_message.reply_text("⛔ Bu buyruq faqat bot egasiga ruxsat etilgan.")
+    text = " ".join(context.args).strip()
+    if not text and update.effective_message.reply_to_message:
+        text = update.effective_message.reply_to_message.text_html or update.effective_message.reply_to_message.caption_html
+    if not text:
+        return await update.effective_message.reply_text("Foydalanish: /broadcast Yangilanish matni")
 
-
-def _normalize_proxy(raw: str) -> Optional[str]:
-    """Validate and normalize proxy string from env.
-    Accepts: http(s)://user:pass@host:port , socks5://host:port , etc.
-    Returns normalized proxy URL or None if invalid.
-    """
-    if not raw:
-        return None
-    p = raw.strip()
-    if not p:
-        return None
-    # If scheme missing, assume http
-    if "://" not in p:
-        p = "http://" + p
-    try:
-        u = urlparse(p)
-        if u.scheme not in ("http", "https", "socks5", "socks5h"):
-            return None
-        # urlparse raises ValueError for bad port in py3.13 sometimes when accessing .port
-        host = u.hostname
-        if not host:
-            return None
+    ids = await dm_all_ids()
+    total = len(ids); ok = 0; fail = 0
+    await update.effective_message.reply_text(f"📣 DM jo‘natish boshlandi. Jami foydalanuvchilar: {total}")
+    for cid in list(ids):
         try:
-            port = u.port
-        except Exception:
-            return None
-        if port is None:
-            return None
-    except Exception:
-        return None
-    return p
+            await context.bot.send_message(cid, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            ok += 1
+            await asyncio.sleep(0.05)
+        except (Exception,) as e:
+            # drop forbidden/bad users
+            await dm_remove_user(cid)
+            fail += 1
+    await update.effective_message.reply_text(f"✅ Yuborildi: {ok} ta, ❌ xatolik: {fail} ta.")
 
-def _parse_js_runtimes_env(value: str) -> Dict[str, Dict[str, Any]]:
-    """Parse YTDLP_JS_RUNTIME env into yt-dlp Python API format.
+async def broadcastpost(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """(OWNER & DM) Reply qilingan postni barcha DM obunachilarga yuborish."""
+    if update.effective_chat.type != "private":
+        return await update.effective_message.reply_text("⛔ Bu buyruq faqat DM (shaxsiy chat)da ishlaydi.")
+    if not is_owner(update):
+        return await update.effective_message.reply_text("⛔ Bu buyruq faqat bot egasiga ruxsat etilgan.")
+    msg = update.effective_message.reply_to_message
+    if not msg:
+        return await update.effective_message.reply_text("Foydalanish: /broadcastpost — yubormoqchi bo‘lgan xabarga reply qiling.")
 
-    yt-dlp (2026+) expects: dict of {runtime: {config}}
-    Examples:
-      - "deno" -> {"deno": {}}
-      - "node" -> {"node": {}}
-      - "node:/usr/bin/node" -> {"node": {"path": "/usr/bin/node"}}
-      - "deno,node" -> {"deno": {}, "node": {}}
+    ids = await dm_all_ids()
+    total = len(ids); ok = 0; fail = 0
+    await update.effective_message.reply_text(f"📣 DM post tarqatish boshlandi. Jami foydalanuvchilar: {total}")
+    for cid in list(ids):
+        try:
+            await context.bot.copy_message(chat_id=cid, from_chat_id=msg.chat_id, message_id=msg.message_id)
+            ok += 1
+            await asyncio.sleep(0.05)
+        except (Exception,) as e:
+            await dm_remove_user(cid)
+            fail += 1
+    await update.effective_message.reply_text(f"✅ Yuborildi: {ok} ta, ❌ xatolik: {fail} ta.")
+
+
+
+# ====================== PER-GROUP SETTINGS (DB-backed) ======================
+# Muammo: TUN_REJIMI / KANAL_USERNAME / MAJBUR_LIMIT va hisoblar global edi.
+# Yechim: Har bir chat_id (guruh) uchun alohida saqlash (Railway Postgres).
+
+_GROUP_SETTINGS_CACHE = {}  # chat_id -> (settings_dict, fetched_monotonic)
+_GROUP_SETTINGS_TTL_SEC = 20
+
+# In-memory fallback (DB bo'lmasa) — counts per (chat_id, user_id)
+_GROUP_COUNTS_MEM = defaultdict(lambda: defaultdict(int))
+
+
+# In-memory privileges cache per group (DB bo'lsa ham tezkor bypass uchun)
+_GROUP_PRIV_MEM = defaultdict(set)  # chat_id -> set(user_id)
+def _default_group_settings():
+    return {"tun": False, "kanal_username": None, "majbur_limit": 0}
+
+async def init_group_db():
+    """Ensure per-group tables exist."""
+    global DB_POOL
+    if not DB_POOL:
+        return
+    async with DB_POOL.acquire() as con:
+        await con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS group_settings (
+                chat_id BIGINT PRIMARY KEY,
+                tun BOOLEAN NOT NULL DEFAULT FALSE,
+                kanal_username TEXT,
+                majbur_limit INT NOT NULL DEFAULT 0,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+            """
+        )
+        await con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS group_user_counts (
+                chat_id BIGINT NOT NULL,
+                user_id BIGINT NOT NULL,
+                cnt INT NOT NULL DEFAULT 0,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                PRIMARY KEY (chat_id, user_id)
+            );
+            """
+        )
+        await con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS group_privileges (
+                chat_id BIGINT NOT NULL,
+                user_id BIGINT NOT NULL,
+                granted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                PRIMARY KEY (chat_id, user_id)
+            );
+            """
+        )
+        await con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS group_blocks (
+                chat_id BIGINT NOT NULL,
+                user_id BIGINT NOT NULL,
+                until_date TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                PRIMARY KEY (chat_id, user_id)
+            );
+            """
+        )
+    log.info("Per-group DB jadvallari tayyor: group_settings, group_user_counts, group_privileges, group_blocks")
+
+async def get_group_settings(chat_id: int) -> dict:
+    """Fetch group settings from DB (cached).
+
+    Muhim: DB vaqtincha uzilib qolsa ham, guruh sozlamalari (tun/kanal/majbur)
+    "o'z-o'zidan o'chib ketmasligi" uchun oxirgi cache qilingan qiymat qaytariladi.
     """
-    v = (value or "").strip()
-    if not v:
-        return {}
-    out: Dict[str, Dict[str, Any]] = {}
-    for part in [p.strip() for p in v.split(",") if p.strip()]:
-        if ":" in part:
-            rt, pth = part.split(":", 1)
-            rt = rt.strip()
-            pth = pth.strip()
-            if rt:
-                cfg: Dict[str, Any] = {}
-                if pth:
-                    cfg["path"] = pth
-                out[rt] = cfg
+    import time
+    now = time.monotonic()
+    cached = _GROUP_SETTINGS_CACHE.get(chat_id)
+    if cached and (now - cached[1]) < _GROUP_SETTINGS_TTL_SEC:
+        return dict(cached[0])
+
+    # Cache bo'lsa, DB xatoda shuni qaytaramiz; bo'lmasa default.
+    fallback = dict(cached[0]) if cached else _default_group_settings()
+
+    if not DB_POOL:
+        # DB yo'q bo'lsa ham cache yangilanadi
+        _GROUP_SETTINGS_CACHE[chat_id] = (dict(fallback), now)
+        return dict(fallback)
+
+    s = _default_group_settings()
+    try:
+        async with DB_POOL.acquire() as con:
+            row = await con.fetchrow(
+                "SELECT tun, kanal_username, majbur_limit FROM group_settings WHERE chat_id=$1;",
+                chat_id
+            )
+        if row:
+            s["tun"] = bool(row["tun"])
+            s["kanal_username"] = row["kanal_username"]
+            s["majbur_limit"] = int(row["majbur_limit"] or 0)
         else:
-            out[part] = {}
+            # ensure row exists
+            async with DB_POOL.acquire() as con:
+                await con.execute(
+                    "INSERT INTO group_settings (chat_id) VALUES ($1) ON CONFLICT DO NOTHING;",
+                    chat_id
+                )
+    except Exception as e:
+        # DB xatoda: oxirgi cache (yoki default) bilan davom etamiz
+        log.warning(f"get_group_settings xatolik (cache bilan davom): {e}")
+        return dict(fallback)
+
+    _GROUP_SETTINGS_CACHE[chat_id] = (dict(s), now)
+    return dict(s)
+
+# Sentinel: differenciate between "parameter not provided" vs explicit None (e.g., /kanaloff)
+_GROUP_SETTINGS_UNSET = object()
+
+async def set_group_settings(chat_id: int, *, tun=_GROUP_SETTINGS_UNSET, kanal_username=_GROUP_SETTINGS_UNSET, majbur_limit=_GROUP_SETTINGS_UNSET):
+    """Upsert group settings for chat_id.
+
+    Important:
+    - If a parameter is not provided (_GROUP_SETTINGS_UNSET), the existing value is preserved.
+    - If kanal_username=None is provided, it is stored as None (this is needed for /kanaloff).
+    """
+    if not DB_POOL:
+        # cache-only fallback
+        cur = await get_group_settings(chat_id)
+        if tun is not _GROUP_SETTINGS_UNSET:
+            cur["tun"] = bool(tun)
+        if kanal_username is not _GROUP_SETTINGS_UNSET:
+            cur["kanal_username"] = kanal_username
+        if majbur_limit is not _GROUP_SETTINGS_UNSET:
+            cur["majbur_limit"] = int(majbur_limit)
+        _GROUP_SETTINGS_CACHE[chat_id] = (cur, __import__("time").monotonic())
+        return
+
+    # Keep unspecified fields unchanged (read current first)
+    cur = await get_group_settings(chat_id)
+    if tun is _GROUP_SETTINGS_UNSET:
+        tun = cur["tun"]
+    if kanal_username is _GROUP_SETTINGS_UNSET:
+        kanal_username = cur["kanal_username"]
+    if majbur_limit is _GROUP_SETTINGS_UNSET:
+        majbur_limit = cur["majbur_limit"]
+
+    try:
+        async with DB_POOL.acquire() as con:
+            await con.execute(
+                """
+                INSERT INTO group_settings (chat_id, tun, kanal_username, majbur_limit, updated_at)
+                VALUES ($1,$2,$3,$4, now())
+                ON CONFLICT (chat_id) DO UPDATE SET
+                    tun=EXCLUDED.tun,
+                    kanal_username=EXCLUDED.kanal_username,
+                    majbur_limit=EXCLUDED.majbur_limit,
+                    updated_at=now();
+                """,
+                chat_id, bool(tun), kanal_username, int(majbur_limit)
+            )
+        _GROUP_SETTINGS_CACHE[chat_id] = ({"tun": bool(tun), "kanal_username": kanal_username, "majbur_limit": int(majbur_limit)}, __import__("time").monotonic())
+    except Exception as e:
+        log.warning(f"set_group_settings xatolik: {e}")
+
+async def group_has_priv(chat_id: int, user_id: int) -> bool:
+
+    # Tezkor cache
+    try:
+        if user_id in _GROUP_PRIV_MEM.get(chat_id, set()):
+            return True
+    except Exception:
+        pass
+
+    if not DB_POOL:
+        # DB yo'q bo'lsa ham cache ishlaydi
+        return user_id in _GROUP_PRIV_MEM.get(chat_id, set())
+
+    try:
+        async with DB_POOL.acquire() as con:
+            v = await con.fetchval(
+                "SELECT 1 FROM group_privileges WHERE chat_id=$1 AND user_id=$2;",
+                chat_id, user_id
+            )
+        ok = bool(v)
+        if ok:
+            _GROUP_PRIV_MEM[chat_id].add(user_id)
+        return ok
+    except Exception as e:
+        log.warning(f"group_has_priv xatolik: {e}")
+        # DB vaqtincha muammo qilsa ham cache'dan qaytamiz
+        return user_id in _GROUP_PRIV_MEM.get(chat_id, set())
+
+async def grant_priv_db(chat_id: int, user_id: int):
+    # Avval cache'ga yozamiz (DB kechiksa ham darhol ishlasin)
+    try:
+        _GROUP_PRIV_MEM[chat_id].add(user_id)
+    except Exception:
+        pass
+
+    if not DB_POOL:
+        return
+    try:
+        async with DB_POOL.acquire() as con:
+            await con.execute(
+                "INSERT INTO group_privileges (chat_id, user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING;",
+                chat_id, user_id
+            )
+    except Exception as e:
+        log.warning(f"grant_priv_db xatolik: {e}")
+
+async def clear_privs_db(chat_id: int):
+    if not DB_POOL:
+        return
+    try:
+        async with DB_POOL.acquire() as con:
+            await con.execute("DELETE FROM group_privileges WHERE chat_id=$1;", chat_id)
+    except Exception:
+        pass
+
+async def get_user_count_db(chat_id: int, user_id: int) -> int:
+    if not DB_POOL:
+        try:
+            return int(_GROUP_COUNTS_MEM[chat_id].get(user_id, 0))
+        except Exception:
+            return 0
+    try:
+        async with DB_POOL.acquire() as con:
+            v = await con.fetchval(
+                "SELECT cnt FROM group_user_counts WHERE chat_id=$1 AND user_id=$2;",
+                chat_id, user_id
+            )
+        return int(v or 0)
+    except Exception:
+        return 0
+
+async def inc_user_count_db(chat_id: int, user_id: int, delta: int = 1):
+    if not DB_POOL:
+        try:
+            _GROUP_COUNTS_MEM[chat_id][user_id] = int(_GROUP_COUNTS_MEM[chat_id].get(user_id, 0)) + int(delta)
+        except Exception:
+            pass
+        return
+    try:
+        async with DB_POOL.acquire() as con:
+            await con.execute(
+                """
+                INSERT INTO group_user_counts (chat_id, user_id, cnt, updated_at)
+                VALUES ($1,$2,$3, now())
+                ON CONFLICT (chat_id, user_id) DO UPDATE SET
+                    cnt = group_user_counts.cnt + EXCLUDED.cnt,
+                    updated_at = now();
+                """,
+                chat_id, user_id, int(delta)
+            )
+    except Exception as e:
+        log.warning(f"inc_user_count_db xatolik: {e}")
+
+async def set_user_count_db(chat_id: int, user_id: int, cnt: int):
+    if not DB_POOL:
+        try:
+            _GROUP_COUNTS_MEM[chat_id][user_id] = int(cnt)
+        except Exception:
+            pass
+        return
+    try:
+        async with DB_POOL.acquire() as con:
+            await con.execute(
+                """
+                INSERT INTO group_user_counts (chat_id, user_id, cnt, updated_at)
+                VALUES ($1,$2,$3, now())
+                ON CONFLICT (chat_id, user_id) DO UPDATE SET
+                    cnt=EXCLUDED.cnt,
+                    updated_at=now();
+                """,
+                chat_id, user_id, int(cnt)
+            )
+    except Exception:
+        pass
+
+async def clear_group_counts_db(chat_id: int):
+    if not DB_POOL:
+        try:
+            _GROUP_COUNTS_MEM.pop(chat_id, None)
+        except Exception:
+            pass
+        return
+    try:
+        async with DB_POOL.acquire() as con:
+            await con.execute("DELETE FROM group_user_counts WHERE chat_id=$1;", chat_id)
+    except Exception:
+        pass
+
+async def top_group_counts_db(chat_id: int, limit: int = 100):
+    if not DB_POOL:
+        try:
+            items = list(_GROUP_COUNTS_MEM.get(chat_id, {}).items())
+            items.sort(key=lambda x: (-int(x[1]), int(x[0])))
+            return [(int(uid), int(cnt)) for uid, cnt in items[: int(limit)]]
+        except Exception:
+            return []
+    try:
+        async with DB_POOL.acquire() as con:
+            rows = await con.fetch(
+                "SELECT user_id, cnt FROM group_user_counts WHERE chat_id=$1 ORDER BY cnt DESC, user_id ASC LIMIT $2;",
+                chat_id, int(limit)
+            )
+        return [(int(r["user_id"]), int(r["cnt"])) for r in rows]
+    except Exception:
+        return []
+
+async def get_block_until_db(chat_id: int, user_id: int):
+    """
+    1) Avval in-memory BLOK_VAQTLARI'ni tekshiradi (DB ishlamay qolsa ham cooldown ishlashi uchun).
+    2) DB bo'lsa — DB'dan ham tekshiradi va eng kattasini qaytaradi.
+    """
+    mem_until = BLOK_VAQTLARI.get((chat_id, user_id))
+    if not DB_POOL:
+        return mem_until
+    try:
+        async with DB_POOL.acquire() as con:
+            row = await con.fetchrow(
+                "SELECT until_date FROM group_blocks WHERE chat_id=$1 AND user_id=$2;",
+                chat_id, user_id
+            )
+        db_until = row["until_date"] if row else None
+        if mem_until and db_until:
+            return mem_until if mem_until >= db_until else db_until
+        return db_until or mem_until
+    except Exception:
+        return mem_until
+async def set_block_until_db(chat_id: int, user_id: int, until_dt):
+    # Har doim in-memory'ni yangilab boramiz (DB xatosida ham cooldown ishlasin)
+    BLOK_VAQTLARI[(chat_id, user_id)] = until_dt
+    if not DB_POOL:
+        return
+    try:
+        async with DB_POOL.acquire() as con:
+            await con.execute(
+                """
+                INSERT INTO group_blocks (chat_id, user_id, until_date, updated_at)
+                VALUES ($1,$2,$3, now())
+                ON CONFLICT (chat_id, user_id) DO UPDATE SET
+                    until_date=EXCLUDED.until_date,
+                    updated_at=now();
+                """,
+                chat_id, user_id, until_dt
+            )
+    except Exception:
+        pass
+async def clear_block_db(chat_id: int, user_id: int):
+    # In-memory'dan har doim o'chiramiz
+    BLOK_VAQTLARI.pop((chat_id, user_id), None)
+    if not DB_POOL:
+        return
+    try:
+        async with DB_POOL.acquire() as con:
+            await con.execute(
+                "DELETE FROM group_blocks WHERE chat_id=$1 AND user_id=$2;",
+                chat_id, user_id
+            )
+    except Exception:
+        pass
+# --------- Override: kanal_tekshir per-group ----------
+async def kanal_tekshir(user_id: int, bot, kanal_username: str | None) -> bool:
+    if not kanal_username:
+        return True
+    try:
+        member = await bot.get_chat_member(kanal_username, user_id)
+        return member.status in ("member", "creator", "administrator")
+    except Exception as e:
+        log.warning(f"kanal_tekshir xatolik: {e}")
+        return False
+
+
+# --- Multi-channel /kanal helpers (per-group) ---
+
+def _normalize_channel_username(raw: str) -> str:
+    s = (raw or "").strip()
+    # accept https://t.me/<name> or t.me/<name>
+    if "t.me/" in s:
+        s = s.split("t.me/", 1)[1]
+        s = s.split("?", 1)[0]
+        s = s.split("/", 1)[0]
+    s = s.strip().rstrip(",;")
+    s = s.lstrip("@")
+    return "@" + s if s else ""
+
+def _parse_kanal_usernames(raw) -> list[str]:
+    # Supported formats in DB: None/empty, single "@ch", space/comma separated, JSON list string.
+    if not raw:
+        return []
+
+    vals: list[str] = []
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return []
+        try:
+            j = __import__("json").loads(s)
+            if isinstance(j, list):
+                vals = [str(x) for x in j]
+            else:
+                vals = [s]
+        except Exception:
+            vals = s.replace(",", " ").split()
+    elif isinstance(raw, list):
+        vals = [str(x) for x in raw]
+    else:
+        vals = [str(raw)]
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for v in vals:
+        ch = _normalize_channel_username(v)
+        if not ch or ch == "@":
+            continue
+        if ch not in seen:
+            out.append(ch)
+            seen.add(ch)
     return out
 
+def _unique_preserve(seq: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for x in seq:
+        if x not in seen:
+            out.append(x)
+            seen.add(x)
+    return out
 
-def build_ydl_base(outtmpl: str, workdir: Optional[str] = None) -> Dict[str, Any]:
-    opts = {
-        "outtmpl": outtmpl,
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "retries": 10,
-        "fragment_retries": 10,
-        "skip_unavailable_fragments": True,
-        "continuedl": True,
-        "concurrent_fragment_downloads": 8,
-        "socket_timeout": 30,
-        "extractor_retries": 3,
-        "nocheckcertificate": True,
-        "buffersize": 1024 * 1024,
-        "http_chunk_size": 10 * 1024 * 1024,
-    }
+async def _check_all_channels(user_id: int, bot, channels: list[str]) -> tuple[bool, list[str]]:
+    missing: list[str] = []
+    for ch in channels:
+        ok = await kanal_tekshir(user_id, bot, ch)
+        if not ok:
+            missing.append(ch)
+    return (len(missing) == 0, missing)
 
+# --------- Override commands: tun/tunoff/kanal/kanaloff/majbur/majburoff/ruxsat ----------
+async def tun(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update):
+        return await update.effective_message.reply_text("⛔ Faqat adminlar.")
+    chat_id = update.effective_chat.id
+    await set_group_settings(chat_id, tun=True)
+    await update.effective_message.reply_text("🌙 Tun rejimi yoqildi. Faqat shu guruhga ta’sir qiladi.")
 
-    # Cookies (YouTube datacenter bloklari uchun foydali)
-    cookiefile = _ensure_cookiefile(workdir)
-    if cookiefile:
-        opts["cookiefile"] = cookiefile
+async def tunoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update):
+        return await update.effective_message.reply_text("⛔ Faqat adminlar.")
+    chat_id = update.effective_chat.id
+    await set_group_settings(chat_id, tun=False)
+    await update.effective_message.reply_text("🌞 Tun rejimi o‘chirildi. Faqat shu guruhga ta’sir qiladi.")
 
-    # YouTube extractor: ba'zan mobile client yumshoqroq ishlaydi
-    opts.setdefault("extractor_args", {})
-    opts["extractor_args"].setdefault("youtube", {})
-    opts["extractor_args"]["youtube"].setdefault("player_client", ["android", "ios", "web"])
+async def kanal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update):
+        return await update.effective_message.reply_text("⛔ Faqat adminlar.")
+    chat_id = update.effective_chat.id
 
-    # HTTP headers (User-Agent / Accept-Language)
-    opts.setdefault("http_headers", {})
-    ua = (os.getenv("YTDLP_UA") or "").strip()
-    if ua:
-        opts["http_headers"]["User-Agent"] = ua
-    else:
-        # default browser UA
-        opts["http_headers"].setdefault(
-            "User-Agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    if context.args:
+        channels: list[str] = []
+        for a in context.args:
+            ch = _normalize_channel_username(a)
+            if ch and ch != "@":
+                channels.append(ch)
+        channels = _unique_preserve(channels)
+        if not channels:
+            return await update.effective_message.reply_text("Namuna: /kanal @kanal1 @kanal2")
+
+        # Store as JSON list (backward compatible: old single value still parses)
+        await set_group_settings(chat_id, kanal_username=__import__("json").dumps(channels, ensure_ascii=False))
+        chan_lines = "\n".join([f"{i}) {ch}" for i, ch in enumerate(channels, start=1)])
+        await update.effective_message.reply_text(
+            "📢 Majburiy kanallar (faqat shu guruh учун):\n" + chan_lines
         )
-    opts["http_headers"].setdefault("Accept-Language", "en-US,en;q=0.9")
-    opts["http_headers"].setdefault("Referer", "https://www.youtube.com/")
+    else:
+        await update.effective_message.reply_text("Namuna: /kanal @kanal1 @kanal2")
 
+async def kanaloff(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update):
+        return await update.effective_message.reply_text("⛔ Faqat adminlar.")
+    chat_id = update.effective_chat.id
+    await set_group_settings(chat_id, kanal_username=None)
+    await update.effective_message.reply_text("🚫 Majburiy kanal talabi o‘chirildi (faqat shu guruh uchun).")
 
-    # Impersonate (ixtiyoriy): YTDLP_IMPERSONATE=chrome|chrome-124:windows-10|safari|...
-    # Yangi yt-dlp (2026+) Python API'da opts["impersonate"] satri endi str emas, ImpersonateTarget bo‘lishi kerak.
-    imp = (os.getenv("YTDLP_IMPERSONATE") or "").strip()
-    if imp:
+async def majbur(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update):
+        return await update.effective_message.reply_text("⛔ Faqat adminlar.")
+    chat_id = update.effective_chat.id
+    if context.args:
         try:
-            from yt_dlp.networking.impersonate import ImpersonateTarget  # type: ignore
-            opts["impersonate"] = ImpersonateTarget.from_str(imp.lower())
-        except Exception as e:
-            # Agar kutubxona/target mos kelmasa, bot yiqilib qolmasligi uchun impersonate'ni o‘chirib yuboramiz.
-            log.warning("Impersonate sozlamasi o‘chirildi (xato: %s). YTDLP_IMPERSONATE=%s", e, imp)
-    # Proxy (ixtiyoriy): YTDLP_PROXY=http://user:pass@host:port
-    proxy_raw = (os.getenv("YTDLP_PROXY") or "").strip()
-    proxy = _normalize_proxy(proxy_raw)
-    if proxy:
-        opts["proxy"] = proxy
-    elif proxy_raw:
-        # noto‘g‘ri proxy bo‘lsa, bot yiqilmasin — proxy’ni e'tiborsiz qoldiramiz
-        log.warning("YTDLP_PROXY noto‘g‘ri formatda, e'tiborsiz qoldirildi: %s", proxy_raw)
+            val = int(context.args[0])
+            if not (3 <= val <= 30):
+                raise ValueError
+            await set_group_settings(chat_id, majbur_limit=val)
+            await update.effective_message.reply_text(
+                f"✅ Majburiy odam qo‘shish limiti: <b>{val}</b> (faqat shu guruh uchun)",
+                parse_mode="HTML"
+            )
+        except ValueError:
+            await update.effective_message.reply_text(
+                "❌ Noto‘g‘ri qiymat. Ruxsat etilgan oraliq: <b>3–30</b>. Masalan: <code>/majbur 10</code>",
+                parse_mode="HTML"
+            )
+    else:
+        await update.effective_message.reply_text(
+            "👥 Guruhda majburiy odam qo‘shishni nechta qilib belgilay? 👇\n\nQo‘shish shart emas — /majburoff",
+            reply_markup=majbur_klaviatura()
+        )
 
-
-    # ffmpeg (merge/MP3 uchun) — Railway/Render'да PATH'da bo'lishi mumkin
-    try:
-        ff = shutil.which('ffmpeg')
-        if ff:
-            opts['ffmpeg_location'] = ff
-    except Exception:
-        pass    # --- YouTube EJS / JS-challenge (formatlar yo‘qolib qolmasligi uchun) ---
-    # Ba'zi videolarda YouTube "bot-check" qilib, JS-challenge yechilmasa faqat storyboard (rasmlar) qolib ketadi.
-    # Buni yechish uchun JS runtime (deno yoki node) va (kerak bo‘lsa) EJS remote component ruxsati kerak bo‘ladi.
-    try:
-        js_runtime_env = (os.getenv("YTDLP_JS_RUNTIME") or "").strip().lower()
-        if js_runtime_env:
-            opts["js_runtimes"] = _parse_js_runtimes_env(js_runtime_env)
-        else:
-            # avtomatik: avval deno, bo‘lmasa node
-            if shutil.which("deno"):
-                opts["js_runtimes"] = {"deno": {}}
-            elif shutil.which("node"):
-                opts["js_runtimes"] = {"node": {}}
-
-        # Remote EJS komponentlarini (github) yuklashga ruxsat: kerak bo‘lsa challenge-solver skriptlarini oladi.
-        # Istasangiz env bilan o‘chirib qo‘yasiz: YTDLP_REMOTE_EJS=0
-        if os.getenv("YTDLP_REMOTE_EJS", "1") == "1":
-            rc = opts.get("remote_components")
-            if rc is None:
-                rc = []
-            if isinstance(rc, str):
-                rc = [rc]
-            if "ejs:github" not in rc:
-                rc.append("ejs:github")
-            opts["remote_components"] = rc
-    except Exception:
-        pass
-
-
-    return opts
-
-def _extract_info(url: str) -> Dict[str, Any]:
-    # Formatlarni ko‘rsatish uchun to‘liq "process=True" kerak bo‘ladi,
-    # aks holda ba'zan faqat audio ko‘rinib qoladi.
-    ydl_opts = build_ydl_base(outtmpl="%(title)s.%(ext)s", workdir=tempfile.gettempdir())
-    ydl_opts["ignore_no_formats_error"] = True
-    ydl_opts["skip_download"] = True
-    # Format ro'yxatini olishda "web" client ko'proq formatlarni qaytaradi.
-    try:
-        ydl_opts.setdefault("extractor_args", {})
-        ydl_opts["extractor_args"].setdefault("youtube", {})
-        ydl_opts["extractor_args"]["youtube"]["player_client"] = ["web", "android", "ios"]
-    except Exception:
-        pass
-    try:
-        with YoutubeDL(ydl_opts) as ydl:
-            return ydl.extract_info(url, download=False)
-    except Exception as e:
-        msg = str(e)
-        if "Impersonate target" in msg and "not available" in msg:
-            # Railway/host muhitida curl-cffi yoki kerakli handler bo‘lmasa, impersonate target mavjud bo‘lmay qoladi.
-            ydl_opts.pop("impersonate", None)
-            log.warning("Impersonate o‘chirildi (mavjud emas): %s", msg)
-            with YoutubeDL(ydl_opts) as ydl:
-                return ydl.extract_info(url, download=False)
-        raise
-
-def _select_youtube_formats(info: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    Return a small curated list of YouTube video formats for buttons.
-
-    We show ONLY these labels (if available): 144/240/360/480/720.
-    Important: some videos have "almost" heights (e.g. 358 instead of 360),
-    so we pick the best format within a tolerance band below each target and
-    store the target label in f["_label_h"].
-    """
-    formats = info.get("formats") or []
-    vids = [f for f in formats if f.get("vcodec") != "none" and f.get("height")]
-
-    # group by height
-    by_h: Dict[int, List[Dict[str, Any]]] = {}
-    for f in vids:
-        try:
-            h = int(f.get("height"))
-        except Exception:
-            continue
-        by_h.setdefault(h, []).append(f)
-
-    desired = [144, 240, 360, 480, 720, 1080]
-    # allow slight deviations (some uploads are 358/478/etc.)
-    tol_map = {144: 40, 240: 50, 360: 60, 480: 80, 720: 140}
-
-    def score(x: Dict[str, Any]) -> Tuple[int, float, int]:
-        # prefer mp4, then higher bitrate, then known filesize
-        ext = (x.get("ext") or "").lower()
-        ext_score = 2 if ext == "mp4" else (1 if ext in ("mkv", "webm") else 0)
-        tbr = float(x.get("tbr") or 0.0)
-        fs = int(x.get("filesize") or x.get("filesize_approx") or 0)
-        return (ext_score, tbr, fs)
-
-    picked: List[Dict[str, Any]] = []
-    used_ids: set[str] = set()
-
-    all_heights = sorted(by_h.keys())
-
-    for target in desired:
-        tol = tol_map.get(target, 60)
-        lo = max(0, target - tol)
-        hi = target
-
-        # pick candidate heights within [lo, hi]
-        hs = [h for h in all_heights if lo <= h <= hi]
-        if not hs:
-            # as a fallback, pick the closest lower-or-equal height
-            hs = [h for h in all_heights if h <= target]
-        if not hs:
-            continue
-
-        # choose the height closest to target (prefer higher), then best score within that height
-        best_h = sorted(hs, key=lambda h: (h, -abs(target - h)), reverse=True)[0]
-        cand = by_h.get(best_h) or []
-        if not cand:
-            continue
-        best = sorted(cand, key=score, reverse=True)[0]
-
-        fid = str(best.get("format_id") or "")
-        if not fid or fid in used_ids:
-            continue
-        used_ids.add(fid)
-
-        # store label height for UI
-        best["_label_h"] = target
-        picked.append(best)
-
-    # absolute fallback: show up to 3 best formats up to 720p
-    if not picked:
-        vids_sorted = sorted(
-            [v for v in vids if int(v.get("height") or 0) <= 720],
-            key=lambda x: float(x.get("tbr") or 0.0),
-            reverse=True,
-        )[:3]
-        for v in vids_sorted:
-            try:
-                v["_label_h"] = int(v.get("height") or 0)
-            except Exception:
-                v["_label_h"] = 0
-        picked = vids_sorted
-
-    return picked
-
-
-def _download_video(url: str, format_id: Optional[str], workdir: str, has_audio: Optional[bool] = None) -> Path:
-    """yt-dlp орқали видеони юклаб олиш.
-
-    format_id:
-      - рақам (YouTube itag) бўлса: шу форматни танлаймиз
-      - 'h:720' каби бўлса: height cap (<=720) бўйича танлаймиз
-      - None бўлса: bestvideo+bestaudio/best
-
-    has_audio:
-      - True  => format_id'нинг ўзида аудио бор (progressive)
-      - False => формат видео-онли (аудиосиз)
-      - None  => номаълум (safe fallback)
-    """
-    outtmpl = os.path.join(workdir, "%(title).200s.%(ext)s")
-
-    def _run_with_opts(opts: Dict[str, Any]) -> Path:
-        """Run yt-dlp download and return a non-empty file path from workdir."""
-        with YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-
-            candidates: List[Path] = []
-            try:
-                fp = ydl.prepare_filename(info)
-                candidates.append(Path(fp))
-            except Exception:
-                pass
-
-            req = info.get("requested_downloads") or info.get("requested_formats") or []
-            for r in req:
-                p = r.get("filepath") or r.get("filename")
-                if p:
-                    candidates.append(Path(p))
-
-            files = [p for p in Path(workdir).iterdir() if p.is_file()]
-            media = [p for p in files if p.suffix.lower() in (".mp4", ".mkv", ".webm", ".mov", ".m4a")]
-            if media:
-                candidates.insert(0, max(media, key=lambda p: p.stat().st_size))
-
-            for p in candidates:
-                try:
-                    if p.exists() and p.stat().st_size > 0:
-                        return p
-                except Exception:
-                    continue
-        raise RuntimeError("Download finished but file not found")
-
-    ydl_opts = build_ydl_base(outtmpl=outtmpl, workdir=workdir)
-    ydl_opts.update({
-        "merge_output_format": "mp4",
-        "postprocessors": [{"key": "FFmpegVideoConvertor", "preferedformat": "mp4"}],
-    })
-
-    # 1) Height-cap pseudo: h:720
-    if format_id and str(format_id).startswith("h:"):
-        try:
-            h = int(str(format_id).split(":", 1)[1])
-        except Exception:
-            h = 720
-        ydl_opts["format"] = f"bestvideo[height<={h}][ext=mp4]+bestaudio[ext=m4a]/best[height<={h}]/best"
-        return _run_with_opts(ydl_opts)
-
-    # 2) Exact itag
-    if format_id:
-        fid = str(format_id).strip()
-        if has_audio is True:
-            ydl_opts["format"] = f"{fid}/best"
-        else:
-            ydl_opts["format"] = f"{fid}+bestaudio[ext=m4a]/bestvideo[ext=mp4]+bestaudio/best"
-        try:
-            return _run_with_opts(ydl_opts)
-        except Exception:
-            pass
-
-    # 3) Ultimate fallback
-    ydl_opts["format"] = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best"
-    return _run_with_opts(ydl_opts)
-
-
-def _download_audio(url: str, workdir: str) -> Path:
-    outtmpl = os.path.join(workdir, "%(id)s.%(ext)s")
-
-    ydl_opts = build_ydl_base(outtmpl=outtmpl, workdir=workdir)
-    ydl_opts["format"] = "bestaudio/best"
-    ydl_opts["postprocessors"] = [{
-        "key": "FFmpegExtractAudio",
-        "preferredcodec": "mp3",
-        "preferredquality": "192",
-    }]
-    try:
-        try:
-            with YoutubeDL(ydl_opts) as ydl:
-                ydl.extract_info(url, download=True)
-        except Exception as e:
-            msg = str(e)
-            if "Impersonate target" in msg and "not available" in msg:
-                ydl_opts.pop("impersonate", None)
-                log.warning("Impersonate o‘chirildi (mavjud emas): %s", msg)
-                with YoutubeDL(ydl_opts) as ydl:
-                    ydl.extract_info(url, download=True)
-            else:
-                raise
-        mp3s = sorted(Path(workdir).glob("*.mp3"), key=lambda x: x.stat().st_mtime, reverse=True)
-        if mp3s:
-            return mp3s[0]
-    except Exception as e:
-        log.warning("MP3 konvertatsiya muvaffaqiyatsiz (ffmpeg yo'q bo'lishi mumkin). Fallback audio: %s", e)
-
-    ydl_opts2 = build_ydl_base(outtmpl=outtmpl, workdir=workdir)
-    ydl_opts2["format"] = "bestaudio/best"
-    try:
-        with YoutubeDL(ydl_opts2) as ydl:
-            info = ydl.extract_info(url, download=True)
-    except Exception as e:
-        msg = str(e)
-        if "Impersonate target" in msg and "not available" in msg:
-            ydl_opts2.pop("impersonate", None)
-            log.warning("Impersonate o‘chirildi (mavjud emas): %s", msg)
-            with YoutubeDL(ydl_opts2) as ydl:
-                info = ydl.extract_info(url, download=True)
-        else:
-            raise
-        fp = ydl.prepare_filename(info)
-        p = Path(fp)
-        if p.exists():
-            return p
-        files = sorted(Path(workdir).glob("*"), key=lambda x: x.stat().st_mtime, reverse=True)
-        if not files:
-            raise RuntimeError("Audio fayl topilmadi")
-        return files[0]
-
-
-# ---------------------------- Bot Handlers ----------------------------
-
-def is_admin(user_id: Optional[int]) -> bool:
-    return bool(user_id) and (user_id in ADMIN_IDS)
-
-def start_text_by_lang(lang: str) -> str:
-    return START_TEXT_RU if lang == LANG_RU else START_TEXT_UZ
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or not update.message:
-        return
-
-    # start bosganlarni DBga yozib boramiz
-    await STORE.touch_user(update.effective_user)
-
-    # Avval saqlangan til bo'lsa — shuni ishlatamiz, bo'lmasa default uz
-    lang = await STORE.get_lang(update.effective_user.id)
-    context.user_data["lang"] = lang
-
-    kb = [[
-        InlineKeyboardButton(_t(LANG_UZ, "btn_uz"), callback_data="lang|uz"),
-        InlineKeyboardButton(_t(LANG_RU, "btn_ru"), callback_data="lang|ru"),
-    ]]
-
-    await update.message.reply_text(
-        start_text_by_lang(lang),
-        parse_mode=ParseMode.HTML,
-        disable_web_page_preview=True,
-        reply_markup=InlineKeyboardMarkup(kb),
-    )
-
-async def on_lang_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def on_set_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update):
+        return await update.callback_query.answer("Faqat adminlar!", show_alert=True)
     q = update.callback_query
-    if not q or not q.from_user:
-        return
-
-    data = q.data or ""
-    parts = data.split("|", maxsplit=1)
-    if len(parts) != 2:
-        return
-    lang = parts[1].strip().lower()
-    if lang not in (LANG_UZ, LANG_RU):
-        lang = LANG_UZ
-
-    # Saqlaymiz
-    context.user_data["lang"] = lang
-    await STORE.set_lang(q.from_user, lang)
-
-    # Javob
+    await q.answer()
+    chat_id = q.message.chat.id
+    data = q.data.split(":", 1)[1]
+    if data == "cancel":
+        return await q.edit_message_text("❌ Bekor qilindi.")
     try:
+        val = int(data)
+        if not (3 <= val <= 30):
+            raise ValueError
+        await set_group_settings(chat_id, majbur_limit=val)
+        await q.edit_message_text(f"✅ Majburiy limit: <b>{val}</b> (faqat shu guruh uchun)", parse_mode="HTML")
+    except Exception:
+        await q.edit_message_text("❌ Noto‘g‘ri qiymat.")
+
+async def majburoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update):
+        return await update.effective_message.reply_text("⛔ Faqat adminlar.")
+    chat_id = update.effective_chat.id
+    await set_group_settings(chat_id, majbur_limit=0)
+    await update.effective_message.reply_text("🚫 Majburiy odam qo‘shish o‘chirildi (faqat shu guruh uchun).")
+
+async def ruxsat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update):
+        return await update.effective_message.reply_text("⛔ Faqat adminlar.")
+    if not update.effective_message.reply_to_message:
+        return await update.effective_message.reply_text("Iltimos, foydalanuvchi xabariga reply qiling.")
+    chat_id = update.effective_chat.id
+    uid = update.effective_message.reply_to_message.from_user.id
+    await grant_priv_db(chat_id, uid)
+    await update.effective_message.reply_text(f"✅ <code>{uid}</code> foydalanuvchiga ruxsat berildi (shu guruhda).", parse_mode="HTML")
+
+# --------- Override stats commands to be per-group ----------
+def _user_label_from_user(u) -> str:
+    if getattr(u, "username", None):
+        return "@" + u.username
+    name = (getattr(u, "full_name", None) or "").strip()
+    if not name:
+        name = (getattr(u, "first_name", None) or "").strip()
+    return name or str(u.id)
+
+def _mention_userid_html(user_id: int, label: str) -> str:
+    return f'<a href="tg://user?id={user_id}">{html.escape(str(label))}</a>'
+
+def _mention_user_html(u) -> str:
+    return _mention_userid_html(u.id, _user_label_from_user(u))
+
+async def _mention_from_id(bot, chat_id: int, user_id: int, cache: dict[int, str]) -> str:
+    if user_id in cache:
+        return cache[user_id]
+    label = str(user_id)
+    try:
+        cm = await bot.get_chat_member(chat_id, user_id)
+        u = getattr(cm, "user", None)
+        if u is not None:
+            label = _user_label_from_user(u)
+    except Exception:
+        pass
+    mention = _mention_userid_html(user_id, label)
+    cache[user_id] = mention
+    return mention
+
+async def top_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update):
+        return await update.effective_message.reply_text("⛔ Faqat adminlar.")
+    chat_id = update.effective_chat.id
+    items = await top_group_counts_db(chat_id, limit=100)
+    if not items:
+        return await update.effective_message.reply_text("Hali hech kim odam qo‘shmagan.")
+    lines = ["🏆 <b>Eng ko‘p odam qo‘shganlar</b> (TOP 100):"]
+    cache: dict[int, str] = {}
+    for i, (uid, cnt) in enumerate(items, start=1):
+        mention = await _mention_from_id(context.bot, chat_id, uid, cache)
+        lines.append(f"{i}. {mention} — <b>{cnt}</b> ta")
+    await update.effective_message.reply_text("\n".join(lines), parse_mode="HTML")
+
+async def cleangroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update):
+        return await update.effective_message.reply_text("⛔ Faqat adminlar.")
+    chat_id = update.effective_chat.id
+    await clear_group_counts_db(chat_id)
+    await clear_privs_db(chat_id)
+    await update.effective_message.reply_text("🗑 Shu guruh bo‘yicha barcha hisoblar va imtiyozlar 0 qilindi.")
+
+async def count_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    uid = update.effective_user.id
+    settings = await get_group_settings(chat_id)
+    limit = int(settings.get("majbur_limit") or 0)
+    cnt = await get_user_count_db(chat_id, uid)
+    if limit > 0:
+        qoldi = max(limit - cnt, 0)
+        await update.effective_message.reply_text(f"📊 Siz {cnt} ta odam qo‘shgansiz. Qolgan: {qoldi} ta.")
+    else:
+        await update.effective_message.reply_text(f"📊 Siz {cnt} ta odam qo‘shgansiz. (Majburiy qo‘shish faol emas)")
+
+async def replycount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update):
+        return await update.effective_message.reply_text("⛔ Faqat adminlar.")
+    msg = update.effective_message
+    if not msg.reply_to_message:
+        return await msg.reply_text("Iltimos, kimning hisobini ko‘rmoqchi bo‘lsangiz o‘sha xabarga reply qiling.")
+    chat_id = update.effective_chat.id
+    u = msg.reply_to_message.from_user
+    uid = u.id
+    cnt = await get_user_count_db(chat_id, uid)
+    await msg.reply_text(f"👤 {_mention_user_html(u)} — <b>{cnt}</b> ta odam qo‘shgan (shu guruhda).", parse_mode="HTML")
+
+async def cleanuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update):
+        return await update.effective_message.reply_text("⛔ Faqat adminlar.")
+    msg = update.effective_message
+    if not msg.reply_to_message:
+        return await msg.reply_text("Iltimos, kimni 0 qilmoqchi bo‘lsangiz o‘sha foydalanuvchi xabariga reply qiling.")
+    chat_id = update.effective_chat.id
+    u = msg.reply_to_message.from_user
+    uid = u.id
+    await set_user_count_db(chat_id, uid, 0)
+    await msg.reply_text(f"🗑 {_mention_user_html(u)} foydalanuvchi hisobi 0 qilindi (shu guruhda).", parse_mode="HTML")
+
+# --------- Override callbacks that depended on global settings ----------
+async def kanal_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    data = (q.data or "")
+    chat_id = q.message.chat.id if q.message else None
+    user_id = q.from_user.id
+
+    # Button ownership check: only the warned user can press.
+    owner_id = None
+    if ":" in data:
+        try:
+            owner_id = int(data.split(":", 1)[1])
+        except Exception:
+            owner_id = None
+
+    # Old messages used callback_data="kanal_azo"; block them to prevent abuse.
+    if owner_id is None and data == "kanal_azo":
+        return await q.answer("Bu eski tugma. Iltimos yangi ogohlantirishni kuting.", show_alert=True)
+
+    if owner_id is not None and owner_id != user_id:
+        return await q.answer("Bu tugma siz uchun emas!", show_alert=True)
+
+    if not chat_id:
+        return await q.answer()
+
+    settings = await get_group_settings(chat_id)
+    kanal_raw = settings.get("kanal_username")
+    kanal_list = _parse_kanal_usernames(kanal_raw)
+
+    # If /kanaloff was used, allow writing.
+    if not kanal_list:
         await q.answer()
+        try:
+            await context.bot.restrict_chat_member(chat_id=chat_id, user_id=user_id, permissions=FULL_PERMS)
+        except Exception:
+            pass
+        try:
+            await clear_block_db(chat_id, user_id)
+        except Exception:
+            pass
+        return await q.edit_message_text("✅ Majburiy kanal talabi o‘chirilgan. Endi guruhda yozishingiz mumkin.")
+
+    ok_all, _missing = await _check_all_channels(user_id, context.bot, kanal_list)
+    if not ok_all:
+        return await q.answer("❌ Hali barcha kanalga a’zo emassiz", show_alert=True)
+
+    await q.answer()
+    try:
+        await context.bot.restrict_chat_member(chat_id=chat_id, user_id=user_id, permissions=FULL_PERMS)
     except Exception:
         pass
-
-    kb = [[
-        InlineKeyboardButton(_t(LANG_UZ, "btn_uz"), callback_data="lang|uz"),
-        InlineKeyboardButton(_t(LANG_RU, "btn_ru"), callback_data="lang|ru"),
-    ]]
-    markup = InlineKeyboardMarkup(kb)
-
     try:
-        await q.edit_message_text(
-            start_text_by_lang(lang),
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-            reply_markup=markup,
-        )
+        await clear_block_db(chat_id, user_id)
     except Exception:
-        # Agar edit bo'lmasa, yangi xabar yuboramiz
-        try:
-            await context.bot.send_message(
-                chat_id=q.message.chat_id if q.message else update.effective_chat.id,
-                text=start_text_by_lang(lang),
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-                reply_markup=markup,
-            )
-        except Exception:
-            pass
+        pass
+    return await q.edit_message_text("✅ A’zo bo‘lganingiz tasdiqlandi. Endi guruhda yozishingiz mumkin.")
 
+async def on_check_added(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = update.effective_user.id if update.effective_user else None
-    if update.message:
-        await update.message.reply_text(f"ID: `{uid}`", parse_mode=ParseMode.MARKDOWN)
-
-async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
-    uid = update.effective_user.id if update.effective_user else None
-    lang = await get_user_lang(update, context)
-
-    if not is_admin(uid):
-        await update.message.reply_text(_t(lang, "not_admin"))
-        return
-
-    text = update.message.text or ""
-    parts = text.split(maxsplit=1)
-    if len(parts) < 2 or not parts[1].strip():
-        await update.message.reply_text(_t(lang, "usage_broadcast"))
-        return
-
-    msg = parts[1].strip()
-    users = await STORE.get_users()
-    sent = 0
-    failed = 0
-
-    await update.message.reply_text(_t(lang, "bc_started", n=len(users)))
-    for u in users:
-        try:
-            await context.bot.send_message(chat_id=u, text=msg)
-            sent += 1
-        except Exception:
-            failed += 1
-    await update.message.reply_text(_t(lang, "bc_done", sent=sent, failed=failed))
-
-async def cmd_broadcastpost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
-    uid = update.effective_user.id if update.effective_user else None
-    lang = await get_user_lang(update, context)
-
-    if not is_admin(uid):
-        await update.message.reply_text(_t(lang, "not_admin"))
-        return
-    if not update.message.reply_to_message:
-        await update.message.reply_text(_t(lang, "usage_broadcastpost"))
-        return
-
-    src: Message = update.message.reply_to_message
-    users = await STORE.get_users()
-    sent = 0
-    failed = 0
-
-    await update.message.reply_text(_t(lang, "bcpost_started", n=len(users)))
-    for u in users:
-        try:
-            await context.bot.copy_message(chat_id=u, from_chat_id=src.chat_id, message_id=src.message_id)
-            sent += 1
-        except Exception:
-            failed += 1
-    await update.message.reply_text(_t(lang, "bc_done", sent=sent, failed=failed))
-
-
-async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.effective_user:
-        return
-
-    # user touch (langni majburan o'zgartirmaymiz)
-    await STORE.touch_user(update.effective_user)
-
-    url = extract_first_url(update.message.text or "")
-    if not url:
-        return
-
-    # TikTok short links (vt.tiktok.com/...) ni to‘liq URL ga yechib olamiz,
-    # shunda /photo/ postlarni to‘g‘ri aniqlash mumkin.
-    url_eff = url
-    if is_tiktok(url):
-        u_low = url.lower()
-        if any(x in u_low for x in ("vt.tiktok.com", "vm.tiktok.com", "tiktok.com/t/")):
-            loop = asyncio.get_running_loop()
-            url_eff = await loop.run_in_executor(None, _resolve_final_url, url)
-        url_eff = _strip_query(url_eff)
-
-    lang = await get_user_lang(update, context)
-
-    origin_chat_id = update.message.chat_id
-    origin_message_id = update.message.message_id
-
-    if is_youtube(url):
-        msg = await update.message.reply_text(_t(lang, "yt_fetching"))
-        asyncio.create_task(
-            _task_show_youtube_formats(
-                context=context,
-                chat_id=msg.chat_id,
-                message_id=msg.message_id,
-                url=url,
-                origin_chat_id=origin_chat_id,
-                origin_message_id=origin_message_id,
-                lang=lang,
-            )
-        )
-    else:
-        # TikTok photo-post (/photo/) — bu turda faqat audio (MP3) taklif qilamiz
-        if is_tiktok_photo(url_eff):
-            token_p = _cache_put({
-                "url": url_eff, "kind": "tt_photo_audio", "format_id": None,
-                "origin_chat_id": origin_chat_id, "origin_message_id": origin_message_id,
-                "lang": lang,
-            })
-            kb = [[InlineKeyboardButton(_t(lang, "btn_mp3"), callback_data=f"dl|{token_p}")]]
-            await update.message.reply_text(_t(lang, "tt_photo_audio_only"), reply_markup=InlineKeyboardMarkup(kb))
-            return
-
-        url_for_dl = url_eff if is_tiktok(url) else url
-
-        kb = []
-        t_v = _cache_put({
-            "url": url_for_dl, "kind": "video", "format_id": None,
-            "origin_chat_id": origin_chat_id, "origin_message_id": origin_message_id,
-            "lang": lang,
-        })
-        t_a = _cache_put({
-            "url": url_for_dl, "kind": "audio", "format_id": None,
-            "origin_chat_id": origin_chat_id, "origin_message_id": origin_message_id,
-            "lang": lang,
-        })
-        kb.append([InlineKeyboardButton(_t(lang, "btn_video"), callback_data=f"dl|{t_v}")])
-        kb.append([InlineKeyboardButton(_t(lang, "btn_audio"), callback_data=f"dl|{t_a}")])
-        await update.message.reply_text(_t(lang, "choose"), reply_markup=InlineKeyboardMarkup(kb))
-
-
-async def _task_show_youtube_formats(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    message_id: int,
-    url: str,
-    origin_chat_id: int,
-    origin_message_id: int,
-    lang: str,
-) -> None:
-    loop = asyncio.get_running_loop()
-    try:
-        info = await loop.run_in_executor(None, _extract_info, url)
-        formats = _select_youtube_formats(info)
-
-        # Agar yt-dlp формат метамаълумотлари тўлиқ келмаса (ёки 1 та форматгина чиқса),
-        # UI барибир 144/240/360/480/720/1080 вариантларни кўрсатади.
-        # Бу вариантлар "h:XXX" pseudo format бўлиб, юклаш пайтида height cap сифатида ишлатилади.
-        # Лекин ҳажмни кўрсатиш учун real форматдан (height<=cap) битрейт/хажмни тахмин қиламиз.
-        if not formats or len(formats) < 2:
-            formats = []
-            for h in (144, 240, 360, 480, 720, 1080):
-                best = _best_video_format_under_height(info, h)
-                pseudo: Dict[str, Any] = {"format_id": f"h:{h}", "height": h, "_label_h": h, "acodec": "none"}
-                if best:
-                    pseudo["tbr"] = best.get("tbr") or best.get("vbr") or 0.0
-                    pseudo["filesize"] = best.get("filesize") or 0
-                    pseudo["filesize_approx"] = best.get("filesize_approx") or 0
-                formats.append(pseudo)
-
-        # Buttonlar: faqat 144/240/360/480/720 (mavjud bo‘lsa)
-        btns: List[InlineKeyboardButton] = []
-        for f in sorted(formats, key=lambda x: int(x.get("height") or 0), reverse=True):
-            fmt_id = str(f.get("format_id"))
-            h = int(f.get("height") or 0)
-            label_h = int(f.get("_label_h") or h)
-
-            has_audio = str(f.get("acodec") or "").lower() not in ("", "none")
-            ytid = str(info.get("id") or "")
-            yt_key = f"yt:{ytid}:{label_h}p" if ytid else None
-
-            total_bytes = _video_total_size_bytes(info, f)
-            size = human_mb_compact(total_bytes)
-            label = f"{label_h}p - {size}" if size else f"{label_h}p"
-
-            token = _cache_put({
-                "url": url, "kind": "video", "format_id": fmt_id,
-                "has_audio": has_audio,
-                "yt_key": yt_key,
-                "origin_chat_id": origin_chat_id, "origin_message_id": origin_message_id,
-                "lang": lang,
-            })
-            btns.append(InlineKeyboardButton(label, callback_data=f"dl|{token}"))
-
-        # 2-column layout (rasmdagidek)
-        kb: List[List[InlineKeyboardButton]] = []
-        for i in range(0, len(btns), 2):
-            kb.append(btns[i:i+2])
-
-        token_a = _cache_put({
-            "url": url, "kind": "audio", "format_id": None,
-            "origin_chat_id": origin_chat_id, "origin_message_id": origin_message_id,
-            "lang": lang,
-        })
-        kb.append([InlineKeyboardButton("🎵 MP3", callback_data=f"dl|{token_a}")])
-
-        # Placeholder "formatlar olinmoqda" xabarini o‘chirib, oblojka (thumbnail) bilan yuboramiz
-        try:
-            await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
-        except Exception:
-            pass
-
-        title_raw = (info.get("title") or "YouTube").strip()
-        # Caption limit uchun title’ni qisqartiramiz
-        if len(title_raw) > 200:
-            title_raw = title_raw[:197] + "..."
-        title = html.escape(title_raw)
-        dur = human_duration(info.get("duration"))
-
-        caption = _t(lang, "yt_caption", title=title, dur=dur)
-        thumb_url = _pick_best_thumbnail_url(info)
-
-        try:
-            if thumb_url:
-                await context.bot.send_photo(
-                    chat_id=origin_chat_id,
-                    photo=thumb_url,
-                    caption=caption,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=InlineKeyboardMarkup(kb),
-                    reply_to_message_id=origin_message_id,
-                )
-            else:
-                await context.bot.send_message(
-                    chat_id=origin_chat_id,
-                    text=caption,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=InlineKeyboardMarkup(kb),
-                    reply_to_message_id=origin_message_id,
-                )
-        except Exception:
-            # Thumbnail yuborilmasa ham — text bilan yuboramiz
-            await context.bot.send_message(
-                chat_id=origin_chat_id,
-                text=caption,
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup(kb),
-                reply_to_message_id=origin_message_id,
-            )
-
-    except Exception as e:
-        log.exception("Formatlarni olishda xato: %s", e)
-        try:
-            await context.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=message_id,
-                text=_t(lang, "fmt_error", err=_friendly_ydl_error(e, lang)),
-            )
-        except Exception:
-            pass
-
-
-
-async def on_download_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.callback_query:
-        return
     q = update.callback_query
+    uid = q.from_user.id
+    chat_id = q.message.chat.id
 
-    # callback timeout bo'lmasligi uchun darhol javob beramiz
-    lang = LANG_UZ
-    if q.from_user:
-        context.user_data.setdefault("lang", await STORE.get_lang(q.from_user.id))
-        lang = context.user_data.get("lang", LANG_UZ)
-    try:
-        await q.answer(_t(lang, "downloading_answer"), show_alert=False)
-    except Exception:
-        pass
-
-    data = q.data or ""
-    if not data.startswith("dl|"):
-        return
-
-    token = data.split("|", maxsplit=1)[1]
-    payload = _cache_get(token)
-    if not payload:
+    # tugma owner check (old behavior)
+    data = q.data
+    if ":" in data:
         try:
-            # Eski tugma
-            if q.message:
-                await q.edit_message_text(_t(lang, "btn_expired"))
-        except Exception:
-            pass
-        return
+            owner_id = int(data.split(":", 1)[1])
+        except ValueError:
+            owner_id = None
+        if owner_id and owner_id != uid:
+            return await q.answer("Bu tugma siz uchun emas!", show_alert=True)
 
-    # Payload topildi — endi format menyusini (tugmalar) xabarini avtomat o‘chirib yuboramiz
-    try:
-        if q.message is not None:
-            await context.bot.delete_message(chat_id=q.message.chat_id, message_id=q.message.message_id)
-    except Exception:
-        pass
+    settings = await get_group_settings(chat_id)
+    limit = int(settings.get("majbur_limit") or 0)
+    cnt = await get_user_count_db(chat_id, uid)
 
-    url = payload["url"]
-    kind = payload["kind"]
-    format_id = payload.get("format_id")
-    has_audio = payload.get("has_audio")
-    yt_key = payload.get("yt_key")
-    lang = payload.get("lang") or lang
-
-    origin_chat_id = int(payload.get("origin_chat_id") or (q.message.chat_id if q.message else update.effective_chat.id))
-    origin_message_id = payload.get("origin_message_id")
-    reply_to_message_id = int(origin_message_id) if str(origin_message_id).isdigit() else None
-
-    # "⏳ ..." ogohlantirishni alohida yuboramiz va yuklab bo‘lganda o‘chirib tashlaymiz
-    status_chat_id: Optional[int] = None
-    status_message_id: Optional[int] = None
-    try:
-        m = await context.bot.send_message(
-            chat_id=origin_chat_id,
-            text=_t(lang, "downloading_wait"),
-            reply_to_message_id=reply_to_message_id,
-        )
-        status_chat_id = m.chat_id
-        status_message_id = m.message_id
-    except Exception:
-        pass
-
-    asyncio.create_task(_task_download_and_send(
-        context=context,
-        chat_id=origin_chat_id,
-        reply_to_message_id=reply_to_message_id,
-        url=url,
-        kind=kind,
-        format_id=format_id,
-        has_audio=has_audio,
-        yt_key=yt_key,
-        lang=lang,
-        status_chat_id=status_chat_id,
-        status_message_id=status_message_id,
-    ))
-async def _send_audio_with_retry(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    path: Path,
-    caption: str,
-    reply_to_message_id: Optional[int],
-) -> None:
-    last_exc: Optional[Exception] = None
-    for _ in range(2):
+    if await group_has_priv(chat_id, uid) or (limit > 0 and cnt >= limit):
         try:
-            with open(path, "rb") as f:
-                await context.bot.send_audio(
-                    chat_id=chat_id,
-                    audio=f,
-                    caption=caption,
-                    reply_to_message_id=reply_to_message_id,
-                )
-            return
-        except TimedOut as e:
-            last_exc = e
-            await asyncio.sleep(2)
-    if last_exc:
-        raise last_exc
-
-async def _send_video_with_retry(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    path: Path,
-    caption: str,
-    reply_to_message_id: Optional[int],
-):
-    """Видео юбориш (2 марта retry) ва Message'ни қайтариш (file_id кеш учун)."""
-    last_exc: Optional[Exception] = None
-    for _ in range(2):
-        try:
-            with open(path, "rb") as f:
-                msg = await context.bot.send_video(
-                    chat_id=chat_id,
-                    video=f,
-                    supports_streaming=True,
-                    caption=caption,
-                    reply_to_message_id=reply_to_message_id,
-                )
-            return msg
-        except TimedOut as e:
-            last_exc = e
-            await asyncio.sleep(2)
-    if last_exc:
-        raise last_exc
-    raise RuntimeError("send_video failed")
-
-async def _send_document_with_retry(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    path: Path,
-    caption: str,
-    reply_to_message_id: Optional[int],
-) -> None:
-    last_exc: Optional[Exception] = None
-    for _ in range(2):
-        try:
-            with open(path, "rb") as f:
-                await context.bot.send_document(
-                    chat_id=chat_id,
-                    document=f,
-                    caption=caption,
-                    reply_to_message_id=reply_to_message_id,
-                )
-            return
-        except TimedOut as e:
-            last_exc = e
-            await asyncio.sleep(2)
-    if last_exc:
-        raise last_exc
-
-
-def _download_tiktok_photos_zip(url: str, workdir: str) -> Path:
-    """Download TikTok /photo/ post images with gallery-dl and pack into ZIP."""
-    outdir = Path(workdir) / "tiktok_photos"
-    outdir.mkdir(parents=True, exist_ok=True)
-
-    # gallery-dl CLI (pip orqali o‘rnatiladi). requirements.txt ga: gallery-dl
-    try:
-        subprocess.run(
-            ["gallery-dl", "-D", str(outdir), url],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=180,
-        )
-    except FileNotFoundError:
-        raise RuntimeError("gallery-dl topilmadi. requirements.txt ga 'gallery-dl' qo‘shing va redeploy qiling.")
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"gallery-dl xato: {e.stderr.strip()[:300] if e.stderr else e}")
-
-    imgs: List[Path] = []
-    for p in outdir.rglob("*"):
-        if p.is_file() and p.suffix.lower() in [".jpg", ".jpeg", ".png", ".webp"]:
-            imgs.append(p)
-
-    if not imgs:
-        raise RuntimeError("TikTok foto topilmadi (ehtimol captcha/blok).")
-
-    zip_path = Path(workdir) / "tiktok_photos.zip"
-    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
-        for p in sorted(imgs):
-            z.write(p, arcname=p.name)
-
-    return zip_path
-
-
-def _download_tiktok_photo_audio(url: str, workdir: str) -> Path:
-    """Best-effort: TikTok /photo/ postdan audio (MP3) chiqarib beradi.
-
-    1) /photo/ID -> /video/ID ko‘rinishiga aylantirib yt-dlp orqali audio
-    2) Agar bo‘lmasa, gallery-dl orqali medialarni tushirib, eng katta mp4/m4a dan audio ajratadi.
-    """
-    clean = _strip_query(url)
-    # 1) Urinib ko‘ramiz: /photo/<id> -> /video/<id>
-    video_variant = re.sub(r"/photo/([0-9]+)/?$", r"/video/\1", clean)
-
-    try:
-        return _download_audio(video_variant, workdir)
-    except Exception as e1:
-        # ba'zi hollarda original URL ham ishlashi mumkin
-        try:
-            return _download_audio(clean, workdir)
-        except Exception:
-            pass
-
-        # 2) Fallback: gallery-dl
-        outdir = Path(workdir) / "tiktok_media"
-        outdir.mkdir(parents=True, exist_ok=True)
-        try:
-            subprocess.run(
-                ["gallery-dl", "-D", str(outdir), clean],
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=180,
-            )
-        except FileNotFoundError:
-            # e1 ni yo‘qotmaslik uchun kerakli hint beramiz
-            raise RuntimeError(
-                "TikTok foto-post audio uchun 'gallery-dl' kerak. requirements.txt ga 'gallery-dl' qo‘shing va redeploy qiling. "
-                f"Asl xato: {str(e1)[:200]}"
-            )
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"gallery-dl xato: {e.stderr.strip()[:300] if e.stderr else e}")
-
-        candidates: List[Path] = []
-        for p in outdir.rglob("*"):
-            if not p.is_file():
-                continue
-            if p.suffix.lower() in [".m4a", ".mp3", ".aac", ".ogg", ".webm", ".mp4"]:
-                candidates.append(p)
-
-        if not candidates:
-            raise RuntimeError("TikTok media topilmadi (ehtimol captcha/blok).")
-
-        src = max(candidates, key=lambda p: p.stat().st_size)
-        if src.suffix.lower() in [".mp3", ".m4a", ".aac", ".ogg"]:
-            return src
-
-        # mp4/webm bo‘lsa, audio ajratamiz
-        out_mp3 = Path(workdir) / "tiktok_audio.mp3"
-        ffmpeg = shutil.which("ffmpeg")
-        if not ffmpeg:
-            # ffmpeg yo‘q bo‘lsa, bor formatni qaytaramiz (Telegram audio sifatida ham yuboriladi)
-            return src
-
-        try:
-            subprocess.run(
-                [ffmpeg, "-y", "-i", str(src), "-vn", "-acodec", "libmp3lame", "-b:a", "192k", str(out_mp3)],
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=180,
-            )
-            return out_mp3
-        except subprocess.CalledProcessError:
-            # oxirgi urinish: audio streamni copy qilib ko‘ramiz
-            out_m4a = Path(workdir) / "tiktok_audio.m4a"
-            subprocess.run(
-                [ffmpeg, "-y", "-i", str(src), "-vn", "-c:a", "copy", str(out_m4a)],
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=180,
-            )
-            return out_m4a
-
-
-
-
-async def _task_download_and_send(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    reply_to_message_id: Optional[int],
-    url: str,
-    kind: str,
-    format_id: Optional[str],
-    has_audio: Optional[bool],
-    yt_key: Optional[str],
-    lang: str,
-    status_chat_id: Optional[int] = None,
-    status_message_id: Optional[int] = None,
-) -> None:
-    loop = asyncio.get_running_loop()
-    try:
-        with tempfile.TemporaryDirectory(prefix="dlbot_") as td:
-            caption = _t(lang, "caption_suffix")
-
-            if kind == "audio":
-                path: Path = await loop.run_in_executor(None, _download_audio, url, td)
-                await _send_audio_with_retry(context, chat_id, path, caption, reply_to_message_id)
-
-            elif kind == "tt_photo_audio":
-                path = await loop.run_in_executor(None, _download_tiktok_photo_audio, url, td)
-                await _send_audio_with_retry(context, chat_id, path, caption, reply_to_message_id)
-
-            else:
-                # 1) Агар шу видео+формат аввал юборилган бўлса — Telegram file_id билан дарҳол юборамиз.
-                if yt_key:
-                    fid_cached = YOUTUBE_FILEID_CACHE.get(yt_key)
-                    if fid_cached:
-                        try:
-                            await context.bot.send_video(
-                                chat_id=chat_id,
-                                video=fid_cached,
-                                supports_streaming=True,
-                                caption=caption,
-                                reply_to_message_id=reply_to_message_id,
-                            )
-                            return
-                        except Exception:
-                            YOUTUBE_FILEID_CACHE.pop(yt_key, None)
-
-                # 2) Юклаб оламиз
-                path = await loop.run_in_executor(None, _download_video, url, format_id, td, has_audio)
-
-                # 3) Upload лимити (api.telegram.org учун одатда ~50MB). Local Bot API server бўлса TG_MAX_UPLOAD_MB'ни катта қилиб қўйинг.
-                try:
-                    size_mb = path.stat().st_size / (1024 * 1024)
-                except Exception:
-                    size_mb = 0.0
-
-                if TG_MAX_UPLOAD_MB > 0 and size_mb > TG_MAX_UPLOAD_MB:
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=_t(
-                            lang,
-                            "err_generic",
-                            err=(
-                                f"Файл ҳажми {size_mb:.1f}MB. Telegram Bot API upload чеклови туфайли юборилмади (лимит: {TG_MAX_UPLOAD_MB}MB). "
-                                "Пастроқ формат танланг ёки Local Bot API server ишлатинг."
-                            ),
-                        ),
-                        reply_to_message_id=reply_to_message_id,
-                    )
-                    return
-
-                # 4) Юбориш ва file_id кешлаш
-                msg = await _send_video_with_retry(context, chat_id, path, caption, reply_to_message_id)
-                if yt_key and msg and getattr(msg, "video", None) is not None:
-                    try:
-                        YOUTUBE_FILEID_CACHE[yt_key] = msg.video.file_id
-                        if len(YOUTUBE_FILEID_CACHE) > YOUTUBE_FILEID_CACHE_MAX:
-                            k = next(iter(YOUTUBE_FILEID_CACHE.keys()))
-                            YOUTUBE_FILEID_CACHE.pop(k, None)
-                    except Exception:
-                        pass
-
-    except Exception as e:
-        log.exception("Download/send xato: %s", e)
-        try:
-            await context.bot.send_message(
+            await context.bot.restrict_chat_member(
                 chat_id=chat_id,
-                text=_t(lang, "err_generic", err=_friendly_ydl_error(e, lang)),
-                reply_to_message_id=reply_to_message_id,
+                user_id=uid,
+                permissions=FULL_PERMS,
             )
         except Exception:
             pass
-    finally:
-        if status_chat_id and status_message_id:
+        await clear_block_db(chat_id, uid)
+        return await q.edit_message_text("✅ Talab bajarilgan! Endi guruhda yozishingiz mumkin.")
+
+    qoldi = max(limit - cnt, 0)
+    return await q.answer(
+        f"❗ Siz hozirgacha {cnt} ta foydalanuvchi qo‘shdingiz va yana {qoldi} ta foydalanuvchi qo‘shishingiz kerak",
+        show_alert=True
+    )
+
+async def on_grant_priv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    chat = q.message.chat if q.message else None
+    user = q.from_user
+    if not (chat and user):
+        return await q.answer()
+    try:
+        member = await context.bot.get_chat_member(chat.id, user.id)
+        if member.status not in ("administrator", "creator"):
+            return await q.answer("Faqat adminlar imtiyoz bera oladi!", show_alert=True)
+    except Exception:
+        return await q.answer("Tekshirishda xatolik.", show_alert=True)
+    await q.answer()
+    try:
+        target_id = int(q.data.split(":", 1)[1])
+    except Exception:
+        return await q.edit_message_text("❌ Noto‘g‘ri ma'lumot.")
+    await grant_priv_db(chat.id, target_id)
+    # Agar foydalanuvchi blokda bo'lsa — darhol blokdan chiqaramiz
+    try:
+        await clear_block_db(chat.id, target_id)
+    except Exception:
+        pass
+    try:
+        await context.bot.restrict_chat_member(
+            chat_id=chat.id,
+            user_id=target_id,
+            permissions=FULL_PERMS,
+        )
+    except Exception:
+        pass
+    await q.edit_message_text(f"🎟 <code>{target_id}</code> foydalanuvchiga imtiyoz berildi. Endi u yozishi mumkin (shu guruhda).", parse_mode="HTML")
+
+# --------- Override Filters: reklama_va_soz_filtri / majbur_filter ----------
+async def reklama_va_soz_filtri(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    # 🔒 Linked kanalning avtomatik forward postlari — teginmaymiz
+    try:
+        if await is_linked_channel_autoforward(msg, context.bot):
+            return
+    except Exception:
+        pass
+    if not msg or not msg.chat or not msg.from_user:
+        return
+
+    chat_id = msg.chat_id
+
+    # Admin/creator/guruh nomidan xabarlar — teginmaymiz
+    if await is_privileged_message(msg, context.bot):
+        return
+    # Oq ro'yxat
+    if msg.from_user.id in WHITELIST or (msg.from_user.username and msg.from_user.username in WHITELIST):
+        return
+
+    settings = await get_group_settings(chat_id)
+
+    # Tun rejimi (shu guruh uchun)
+    if settings.get("tun"):
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        return
+
+    kanal_raw = settings.get("kanal_username")
+    kanal_list = _parse_kanal_usernames(kanal_raw)
+
+    # Cooldown: foydalanuvchi 1 daqiqalik blokda bo'lsa — xabarini o'chirib, ogohlantirmaymiz
+    uid = msg.from_user.id
+    now = datetime.now(timezone.utc)
+    until_old = await get_block_until_db(chat_id, uid)
+    if until_old and now < until_old:
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        return
+    if until_old and now >= until_old:
+        await clear_block_db(chat_id, uid)
+
+    # Kanal a'zoligi (shu guruh uchun) - ko'p kanalli
+    if kanal_list:
+        ok_all, _missing = await _check_all_channels(uid, context.bot, kanal_list)
+        if not ok_all:
             try:
-                await context.bot.delete_message(chat_id=status_chat_id, message_id=status_message_id)
+                await msg.delete()
             except Exception:
                 pass
 
+            # 1 daqiqaga blok (shu guruh uchun)
+            until = datetime.now(timezone.utc) + timedelta(minutes=1)
+            await set_block_until_db(chat_id, uid, until)
+            try:
+                await context.bot.restrict_chat_member(
+                    chat_id=chat_id,
+                    user_id=uid,
+                    permissions=BLOCK_PERMS,
+                    until_date=until
+                )
+            except Exception as e:
+                log.warning(f"Restrict failed: {e}")
+            kb = [
+                [InlineKeyboardButton("✅ Men a’zo bo‘ldim", callback_data=f"kanal_azo:{uid}")],
+                [InlineKeyboardButton("➕ Guruhga qo‘shish", url=admin_add_link(context.bot.username))]
+            ]
+            mention = _mention_user_html(msg.from_user)
+            chan_lines = "\n".join([f"{i}) {html.escape(ch)}" for i, ch in enumerate(kanal_list, start=1)])
+            warn_text = (
+                f"⚠️ {mention} guruhda yozish uchun shu kanallarga a'zo bo'ling:\n{chan_lines}\n\n"
+                "⏳ 1 daqiqaga bloklandi"
+            )# Oldingi ogohlantirishni o'chirish (shu foydalanuvchi uchun)
+            key = (chat_id, uid)
+            prev_mid = KANAL_WARN_MSG_IDS.get(key)
+            if prev_mid:
+                try:
+                    await context.bot.delete_message(chat_id=chat_id, message_id=prev_mid)
+                except Exception:
+                    pass
 
-# ---------------------------- App lifecycle ----------------------------
+            warn_msg = await context.bot.send_message(
+                chat_id=chat_id,
+                text=warn_text,
+                reply_markup=InlineKeyboardMarkup(kb),
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
+            KANAL_WARN_MSG_IDS[key] = warn_msg.message_id
+            return
 
-async def _post_init(app):
-    await STORE.init()
+    # Quyidagi qism — eski logikangiz (reklama/ssilka/uyatli sozlar) o'zgarishsiz:
+    text = msg.text or msg.caption or ""
+    entities = msg.entities or msg.caption_entities or []
+
+    if getattr(msg, "via_bot", None):
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"⚠️ {msg.from_user.mention_html()}, yashirin ssilka yuborish taqiqlangan!",
+            reply_markup=add_to_group_kb(context.bot.username),
+            parse_mode="HTML"
+        )
+        return
+
+    if has_suspicious_buttons(msg):
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="⚠️ O‘yin/veb-app tugmali reklama taqiqlangan!",
+            reply_markup=add_to_group_kb(context.bot.username)
+        )
+        return
+
+    low = text.lower()
+    if any(k in low for k in SUSPECT_KEYWORDS):
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="⚠️ O‘yin reklamalari taqiqlangan!",
+            reply_markup=add_to_group_kb(context.bot.username)
+        )
+        return
+
+    if getattr(msg.from_user, "is_bot", False):
+        has_game = bool(getattr(msg, "game", None))
+        has_url_entity = any(ent.type in ("text_link", "url", "mention") for ent in entities)
+        has_url_text = any(x in low for x in ("t.me","telegram.me","http://","https://","www.","youtu.be","youtube.com"))
+        if has_game or has_url_entity or has_url_text:
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"⚠️ {msg.from_user.mention_html()}, reklama/ssilka yuborish taqiqlangan!",
+                reply_markup=add_to_group_kb(context.bot.username),
+                parse_mode="HTML"
+            )
+            return
+
+    for ent in entities:
+        if ent.type in ("text_link", "url", "mention"):
+            url = getattr(ent, "url", "") or ""
+            if url and ("t.me" in url or "telegram.me" in url or "http://" in url or "https://" in url):
+                try:
+                    await msg.delete()
+                except Exception:
+                    pass
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"⚠️ {msg.from_user.mention_html()}, yashirin ssilka yuborish taqiqlangan!",
+                    reply_markup=add_to_group_kb(context.bot.username),
+                    parse_mode="HTML"
+                )
+                return
+
+    if any(x in low for x in ("t.me","telegram.me","@","www.","https://youtu.be","http://","https://")):
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"⚠️ {msg.from_user.mention_html()}, reklama/ssilka yuborish taqiqlangan!",
+            reply_markup=add_to_group_kb(context.bot.username),
+            parse_mode="HTML"
+        )
+        return
+
+    sozlar = matndan_sozlar_olish(text)
+    if any(s in UYATLI_SOZLAR for s in sozlar):
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"⚠️ {msg.from_user.mention_html()}, guruhda so‘kinish taqiqlangan!",
+            reply_markup=add_to_group_kb(context.bot.username),
+            parse_mode="HTML"
+        )
+        return
+
+async def majbur_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    # 🔒 Linked kanalning avtomatik forward postlari — teginmaymiz
     try:
-        users = await STORE.get_users()
-        log.info("Users loaded: %d", len(users))
+        if await is_linked_channel_autoforward(msg, context.bot):
+            return
+    except Exception:
+        pass
+    if not msg or not msg.from_user:
+        return
+    if await is_privileged_message(msg, context.bot):
+        return
+
+    chat_id = msg.chat_id
+    uid = msg.from_user.id
+
+    settings = await get_group_settings(chat_id)
+    limit = int(settings.get("majbur_limit") or 0)
+    if limit <= 0:
+        return
+
+    # Agar foydalanuvchi hanuz blokda bo'lsa — xabarini o'chirib, hech narsa yubormaymiz
+    now = datetime.now(timezone.utc)
+    until_old = await get_block_until_db(chat_id, uid)
+    if until_old and now < until_old:
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        return
+    if until_old and now >= until_old:
+        await clear_block_db(chat_id, uid)
+
+    if await group_has_priv(chat_id, uid):
+        return
+
+    cnt = await get_user_count_db(chat_id, uid)
+    if cnt >= limit:
+        return
+
+    # Xabarni o'chiramiz
+    try:
+        await msg.delete()
+    except Exception:
+        return
+
+    # 1 daqiqaga blok (shu guruh uchun)
+    until = datetime.now(timezone.utc) + timedelta(minutes=1)
+    await set_block_until_db(chat_id, uid, until)
+    try:
+        await context.bot.restrict_chat_member(
+            chat_id=chat_id,
+            user_id=uid,
+            permissions=BLOCK_PERMS,
+            until_date=until
+        )
+    except Exception as e:
+        log.warning(f"Restrict failed: {e}")
+
+    qoldi = max(limit - cnt, 0)
+    kb = [
+        [InlineKeyboardButton("✅ Odam qo‘shdim", callback_data=f"check_added:{uid}")],
+        [InlineKeyboardButton("🎟 Imtiyoz berish", callback_data=f"grant:{uid}")],
+        [InlineKeyboardButton("➕ Guruhga qo‘shish", url=admin_add_link(context.bot.username))],
+        [InlineKeyboardButton("⏳ 1 daqiqaga bloklandi", callback_data="noop")]
+    ]
+    # Oldingi ogohlantirishni o'chirish (shu foydalanuvchi uchun)
+    key = (chat_id, uid)
+    prev_mid = MAJBUR_WARN_MSG_IDS.get(key)
+    if prev_mid:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=prev_mid)
+        except Exception:
+            pass
+
+    warn_msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"⚠️ {_mention_user_html(msg.from_user)} guruhda yozish uchun {limit} ta odam qo‘shishingiz kerak! Qolgan: {qoldi} ta.",
+        reply_markup=InlineKeyboardMarkup(kb),
+        parse_mode="HTML"
+    )
+    MAJBUR_WARN_MSG_IDS[key] = warn_msg.message_id
+
+# --------- Override join handler: per-group count ----------
+async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    adder = msg.from_user
+    members = msg.new_chat_members or []
+    if not adder:
+        return
+    chat_id = msg.chat_id
+    for m in members:
+        if adder.id != m.id:
+            await inc_user_count_db(chat_id, adder.id, 1)
+    try:
+        await msg.delete()
     except Exception:
         pass
 
-async def _post_shutdown(app):
-    await STORE.close()
+# --------- Leave handler: delete “user left / removed” service messages ----------
+async def on_left_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if not msg:
+        return
+    try:
+        await msg.delete()
+    except Exception:
+        pass
 
-def build_app():
-    # Telegram upload vaqtida timeout kamayishi uchun timeoutlarni kattalashtiramiz
-    request = HTTPXRequest(connect_timeout=30, read_timeout=300, write_timeout=300, pool_timeout=30)
-    app = (
-        ApplicationBuilder()
-        .token(TOKEN)
-        .request(request)
-        .post_init(_post_init)
-        .post_shutdown(_post_shutdown)
-        .build()
+# --------- Override post_init to also init group tables ----------
+async def noop_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Inline 'noop' tugmasi uchun: callback query loading'ni darhol yopadi."""
+    try:
+        if update.callback_query:
+            await update.callback_query.answer()
+    except Exception:
+        pass
+
+async def post_init(app):
+    await init_db(app)
+    await init_group_db()
+    await set_commands(app)
+
+# ==================== END PER-GROUP SETTINGS (DB-backed) ====================
+
+# ---------------------- Setup ----------------------
+async def set_commands(app):
+    await app.bot.set_my_commands(
+        commands=[
+            BotCommand("start", "Bot haqida ma'lumot"),
+            BotCommand("help", "Bot qo'llanmasi"),
+            BotCommand("id", "Sizning ID’ingiz"),
+            BotCommand("count", "Siz nechta qo‘shgansiz"),
+            BotCommand("top", "TOP 100 ro‘yxati"),
+            BotCommand("replycount", "(reply) foydalanuvchi nechta qo‘shganini ko‘rish"),
+            BotCommand("majbur", "Majburiy odam limitini (3–30) o‘rnatish"),
+            BotCommand("majburoff", "Majburiy qo‘shishni o‘chirish"),
+            BotCommand("cleangroup", "Hamma hisobini 0 qilish"),
+            BotCommand("cleanuser", "(reply) foydalanuvchi hisobini 0 qilish"),
+            BotCommand("ruxsat", "(reply) imtiyoz berish"),
+            BotCommand("kanal", "Majburiy kanalni sozlash"),
+            BotCommand("kanaloff", "Majburiy kanalni o‘chirish"),
+            BotCommand("tun", "Tun rejimini yoqish"),
+            BotCommand("tunoff", "Tun rejimini o‘chirish"),
+            BotCommand("broadcast", "Barcha DM foydalanuvchilarga matn yuborish (owner)"),
+            BotCommand("broadcastpost", "Barcha DM foydalanuvchilarga post-forward (owner)"),
+        ],
+        scope=BotCommandScopeAllPrivateChats()
     )
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("id", cmd_id))
-    app.add_handler(CommandHandler("broadcast", cmd_broadcast))
-    app.add_handler(CommandHandler("broadcastpost", cmd_broadcastpost))
-
-    app.add_handler(CallbackQueryHandler(on_lang_button, pattern=r"^lang\|"))
-    app.add_handler(CallbackQueryHandler(on_download_button, pattern=r"^dl\|"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
-
-    return app
+async def post_init(app):
+    await init_db(app)
+    await set_commands(app)
 
 
-def main() -> None:
-    app = build_app()
-    log.info("Bot started. Admins: %s", ",".join(str(x) for x in sorted(ADMIN_IDS)) if ADMIN_IDS else "(not set)")
+def main():
+    start_web()
 
-    mode = RUN_MODE
-    if mode not in ("webhook", "polling"):
-        mode = "webhook" if WEBHOOK_URL_BASE else "polling"
-
-    if mode == "webhook":
-        if not WEBHOOK_URL_BASE:
-            raise RuntimeError("RUN_MODE=webhook, lekin WEBHOOK_URL (yoki RENDER_EXTERNAL_URL) topilmadi")
-
-        full_webhook_url = WEBHOOK_URL_BASE.rstrip("/") + "/" + WEBHOOK_PATH
-        log.info("Webhook mode. URL: %s", full_webhook_url)
-
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            url_path=WEBHOOK_PATH,
-            webhook_url=full_webhook_url,
-            allowed_updates=Update.ALL_TYPES,
-        )
+    log.info("Bot start: polling mode (Railway).")
+    if os.getenv("DATABASE_URL") or os.getenv("INTERNAL_DATABASE_URL") or os.getenv("DATABASE_INTERNAL_URL") or os.getenv("DB_URL"):
+        log.info("DB: Postgres URL topildi (asyncpg pool init qilinadi).")
     else:
-        log.info("Polling mode.")
-        app.run_polling(allowed_updates=Update.ALL_TYPES)
+        log.warning("DB: DATABASE_URL topilmadi (DM ro'yxat JSON fallback). Railway'da Postgres ulasangiz, Variables ga DATABASE_URL qo'ying.")
+
+    app = ApplicationBuilder().token(TOKEN).build()
+
+    # Commands
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help))
+    app.add_handler(CommandHandler("id", id_berish))
+    app.add_handler(CommandHandler("tun", tun))
+    app.add_handler(CommandHandler("tunoff", tunoff))
+    app.add_handler(CommandHandler("ruxsat", ruxsat))
+    app.add_handler(CommandHandler("kanal", kanal))
+    app.add_handler(CommandHandler("kanaloff", kanaloff))
+    app.add_handler(CommandHandler("majbur", majbur))
+    app.add_handler(CommandHandler("majburoff", majburoff))
+    app.add_handler(CommandHandler("top", top_cmd))
+    app.add_handler(CommandHandler("cleangroup", cleangroup))
+    app.add_handler(CommandHandler("count", count_cmd))
+    app.add_handler(CommandHandler("replycount", replycount))
+    app.add_handler(CommandHandler("cleanuser", cleanuser))
+
+    # DM broadcast (owner only)
+    app.add_handler(CommandHandler("broadcast", broadcast))
+    app.add_handler(CommandHandler("broadcastpost", broadcastpost))
+
+    # Callbacks
+    app.add_handler(CallbackQueryHandler(on_set_limit, pattern=r"^set_limit:"))
+    app.add_handler(CallbackQueryHandler(kanal_callback, pattern=r"^kanal_azo(?::\d+)?$"))
+    app.add_handler(CallbackQueryHandler(on_check_added, pattern=r"^check_added(?::\d+)?$"))
+    app.add_handler(CallbackQueryHandler(on_grant_priv, pattern=r"^grant:"))
+    app.add_handler(CallbackQueryHandler(noop_cb, pattern=r"^noop$"))
+
+    # Events & Filters
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_members))
+    app.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, on_left_member))
+    media_filters = (filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.ANIMATION | filters.VOICE | filters.VIDEO_NOTE | filters.GAME)
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE, track_private), group=-3)
+    app.add_handler(MessageHandler(media_filters & (~filters.COMMAND), majbur_filter), group=-2)
+    app.add_handler(MessageHandler(media_filters & (~filters.COMMAND), reklama_va_soz_filtri), group=-1)
+
+    # Post-init hook
+    app.post_init = post_init
+
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
     main()
+
