@@ -1955,18 +1955,44 @@ async def ruxsat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_message.reply_to_message:
         return await update.effective_message.reply_text("Iltimos, foydalanuvchi xabariga reply qiling.")
     chat_id = update.effective_chat.id
-    uid = update.effective_message.reply_to_message.from_user.id
+    target_user = update.effective_message.reply_to_message.from_user
+    uid = target_user.id
+
     await grant_priv_db(chat_id, uid)
-    await update.effective_message.reply_text(f"✅ <code>{uid}</code> foydalanuvchiga ruxsat berildi (shu guruhda).", parse_mode="HTML")
+
+    # Agar foydalanuvchi avval bloklangan bo'lsa — darhol blokdan chiqaramiz
+    try:
+        await clear_block_db(chat_id, uid)
+    except Exception:
+        pass
+    try:
+        await context.bot.restrict_chat_member(
+            chat_id=chat_id,
+            user_id=uid,
+            permissions=FULL_PERMS,
+        )
+    except Exception:
+        pass
+
+    label = html.escape(_user_label_from_user(target_user))
+    await update.effective_message.reply_text(
+        f"✅ {label} foydalanuvchiga ruxsat berildi (shu guruhda).",
+        parse_mode="HTML"
+    )
 
 # --------- Override stats commands to be per-group ----------
 def _user_label_from_user(u) -> str:
-    if getattr(u, "username", None):
-        return "@" + u.username
+    # Display name for messages/mentions: prefer full name, then @username, then ID
     name = (getattr(u, "full_name", None) or "").strip()
     if not name:
-        name = (getattr(u, "first_name", None) or "").strip()
-    return name or str(u.id)
+        fn = (getattr(u, "first_name", None) or "").strip()
+        ln = (getattr(u, "last_name", None) or "").strip()
+        name = (fn + (" " + ln if ln else "")).strip()
+    if name:
+        return name
+    if getattr(u, "username", None):
+        return "@" + u.username
+    return str(getattr(u, "id", ""))
 
 def _mention_userid_html(user_id: int, label: str) -> str:
     return f'<a href="tg://user?id={user_id}">{html.escape(str(label))}</a>'
@@ -2173,7 +2199,20 @@ async def on_grant_priv(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception:
         pass
-    await q.edit_message_text(f"🎟 <code>{target_id}</code> foydalanuvchiga imtiyoz berildi. Endi u yozishi mumkin (shu guruhda).", parse_mode="HTML")
+    # Target foydalanuvchi ismini olish (mavjud bo'lsa)
+    label = str(target_id)
+    try:
+        cm = await context.bot.get_chat_member(chat.id, target_id)
+        tu = getattr(cm, "user", None)
+        if tu is not None:
+            label = html.escape(_user_label_from_user(tu))
+    except Exception:
+        label = str(target_id)
+
+    await q.edit_message_text(
+        f"🎟 {label} foydalanuvchiga imtiyoz berildi. Endi u yozishi mumkin (shu guruhda).",
+        parse_mode="HTML"
+    )
 
 # --------- Override Filters: reklama_va_soz_filtri / majbur_filter ----------
 async def reklama_va_soz_filtri(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2196,10 +2235,13 @@ async def reklama_va_soz_filtri(update: Update, context: ContextTypes.DEFAULT_TY
     if msg.from_user.id in WHITELIST or (msg.from_user.username and msg.from_user.username in WHITELIST):
         return
 
+    uid = msg.from_user.id
+    has_priv = await group_has_priv(chat_id, uid)
+
     settings = await get_group_settings(chat_id)
 
-    # Tun rejimi (shu guruh uchun)
-    if settings.get("tun"):
+    # Tun rejimi (shu guruh uchun) — imtiyozli foydalanuvchiga ta’sir qilmaydi
+    if settings.get("tun") and not has_priv:
         try:
             await msg.delete()
         except Exception:
@@ -2210,20 +2252,24 @@ async def reklama_va_soz_filtri(update: Update, context: ContextTypes.DEFAULT_TY
     kanal_list = _parse_kanal_usernames(kanal_raw)
 
     # Cooldown: foydalanuvchi 1 daqiqalik blokda bo'lsa — xabarini o'chirib, ogohlantirmaymiz
-    uid = msg.from_user.id
     now = datetime.now(timezone.utc)
     until_old = await get_block_until_db(chat_id, uid)
-    if until_old and now < until_old:
+    if until_old and now < until_old and not has_priv:
         try:
             await msg.delete()
         except Exception:
             pass
         return
+    if until_old and now < until_old and has_priv:
+        try:
+            await clear_block_db(chat_id, uid)
+        except Exception:
+            pass
     if until_old and now >= until_old:
         await clear_block_db(chat_id, uid)
 
     # Kanal a'zoligi (shu guruh uchun) - ko'p kanalli
-    if kanal_list:
+    if kanal_list and not has_priv:
         ok_all, _missing = await _check_all_channels(uid, context.bot, kanal_list)
         if not ok_all:
             try:
@@ -2245,6 +2291,7 @@ async def reklama_va_soz_filtri(update: Update, context: ContextTypes.DEFAULT_TY
                 log.warning(f"Restrict failed: {e}")
             kb = [
                 [InlineKeyboardButton("✅ Men a’zo bo‘ldim", callback_data=f"kanal_azo:{uid}")],
+                [InlineKeyboardButton("🎟 Imtiyoz berish", callback_data=f"grant:{uid}")],
                 [InlineKeyboardButton("➕ Guruhga qo‘shish", url=admin_add_link(context.bot.username))]
             ]
             mention = _mention_user_html(msg.from_user)
@@ -2394,6 +2441,14 @@ async def majbur_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if limit <= 0:
         return
 
+    # Imtiyoz bo'lsa — majburiy talab/cooldown ishlamaydi
+    if await group_has_priv(chat_id, uid):
+        try:
+            await clear_block_db(chat_id, uid)
+        except Exception:
+            pass
+        return
+
     # Agar foydalanuvchi hanuz blokda bo'lsa — xabarini o'chirib, hech narsa yubormaymiz
     now = datetime.now(timezone.utc)
     until_old = await get_block_until_db(chat_id, uid)
@@ -2405,9 +2460,6 @@ async def majbur_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if until_old and now >= until_old:
         await clear_block_db(chat_id, uid)
-
-    if await group_has_priv(chat_id, uid):
-        return
 
     cnt = await get_user_count_db(chat_id, uid)
     if cnt >= limit:
