@@ -1434,6 +1434,101 @@ async def broadcastpost(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+
+# ---------------------- GROUP: Broadcast (owner only) ----------------------
+async def group_all_chat_ids() -> List[int]:
+    # Guruh chat_id lar ro'yxati (DB'dagi group_settings jadvalidan).
+    global DB_POOL
+    if not DB_POOL:
+        return []
+    try:
+        async with DB_POOL.acquire() as con:
+            rows = await con.fetch("SELECT chat_id FROM group_settings;")
+        return [int(r["chat_id"]) for r in rows]
+    except Exception as e:
+        log.warning(f"group_all_chat_ids(DB) xatolik: {e}")
+        return []
+
+async def broadcastgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # (OWNER & DM) Matnni bot admin bo'lgan barcha guruhlarga yuborish.
+    if update.effective_chat.type != "private":
+        return await update.effective_message.reply_text("⛔ Bu buyruq faqat DM (shaxsiy chat)da ishlaydi.")
+    if not is_owner(update):
+        return await update.effective_message.reply_text("⛔ Bu buyruq faqat bot egasiga ruxsat etilgan.")
+    text = " ".join(context.args).strip()
+    if not text and update.effective_message.reply_to_message:
+        text = update.effective_message.reply_to_message.text_html or update.effective_message.reply_to_message.caption_html
+    if not text:
+        return await update.effective_message.reply_text("Foydalanish: /broadcastgroup Matn (yoki xabarga reply qilib yuboring)")
+
+    group_ids = await group_all_chat_ids()
+    if not group_ids:
+        return await update.effective_message.reply_text("⚠️ Guruhlar ro'yxati topilmadi (DB yo'q yoki hali guruh sozlamalari yaratilmagan).")
+
+    me = await context.bot.get_me()
+    total = len(group_ids); ok = 0; fail = 0; skipped = 0
+    await update.effective_message.reply_text(f"📣 Guruhlarga jo‘natish boshlandi. DB'da: {total} ta guruh (faqat bot admin bo‘lganlariga yuboriladi).")
+    for gid in list(group_ids):
+        try:
+            cm = await context.bot.get_chat_member(gid, me.id)
+            if cm.status not in ("administrator", "creator", "owner"):
+                skipped += 1
+                continue
+            await context.bot.send_message(gid, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            ok += 1
+            await asyncio.sleep(0.05)
+        except Exception as e:
+            fail += 1
+            # Agar bot guruhdan chiqarilgan bo'lsa — keyinchalik ro'yxatdan tozalab qo'yamiz (best-effort)
+            try:
+                if DB_POOL:
+                    low = str(e).lower()
+                    if "forbidden" in low or "kicked" in low or "chat not found" in low:
+                        async with DB_POOL.acquire() as con:
+                            await con.execute("DELETE FROM group_settings WHERE chat_id=$1;", gid)
+            except Exception:
+                pass
+    await update.effective_message.reply_text(f"✅ Yuborildi: {ok} ta guruh, ⏭️ o‘tkazildi (admin emas): {skipped} ta, ❌ xatolik: {fail} ta.")
+
+async def broadcastpostgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # (OWNER & DM) Reply qilingan postni bot admin bo'lgan barcha guruhlarga yuborish.
+    if update.effective_chat.type != "private":
+        return await update.effective_message.reply_text("⛔ Bu buyruq faqat DM (shaxsiy chat)da ishlaydi.")
+    if not is_owner(update):
+        return await update.effective_message.reply_text("⛔ Bu buyruq faqat bot egasiga ruxsat etilgan.")
+    msg = update.effective_message.reply_to_message
+    if not msg:
+        return await update.effective_message.reply_text("Foydalanish: /broadcastpostgroup — yubormoqchi bo‘lgan xabarga reply qiling.")
+
+    group_ids = await group_all_chat_ids()
+    if not group_ids:
+        return await update.effective_message.reply_text("⚠️ Guruhlar ro'yxati topilmadi (DB yo'q yoki hali guruh sozlamalari yaratilmagan).")
+
+    me = await context.bot.get_me()
+    total = len(group_ids); ok = 0; fail = 0; skipped = 0
+    await update.effective_message.reply_text(f"📣 Guruhlarga post tarqatish boshlandi. DB'da: {total} ta guruh (faqat bot admin bo‘lganlariga yuboriladi).")
+    for gid in list(group_ids):
+        try:
+            cm = await context.bot.get_chat_member(gid, me.id)
+            if cm.status not in ("administrator", "creator", "owner"):
+                skipped += 1
+                continue
+            await context.bot.copy_message(chat_id=gid, from_chat_id=msg.chat_id, message_id=msg.message_id)
+            ok += 1
+            await asyncio.sleep(0.05)
+        except Exception as e:
+            fail += 1
+            try:
+                if DB_POOL:
+                    low = str(e).lower()
+                    if "forbidden" in low or "kicked" in low or "chat not found" in low:
+                        async with DB_POOL.acquire() as con:
+                            await con.execute("DELETE FROM group_settings WHERE chat_id=$1;", gid)
+            except Exception:
+                pass
+    await update.effective_message.reply_text(f"✅ Yuborildi: {ok} ta guruh, ⏭️ o‘tkazildi (admin emas): {skipped} ta, ❌ xatolik: {fail} ta.")
+
+
 # ====================== PER-GROUP SETTINGS (DB-backed) ======================
 # Muammo: TUN_REJIMI / KANAL_USERNAME / MAJBUR_LIMIT va hisoblar global edi.
 # Yechim: Har bir chat_id (guruh) uchun alohida saqlash (Railway Postgres).
@@ -2640,6 +2735,8 @@ async def set_commands(app):
             BotCommand("tunoff", "Tun rejimini o‘chirish"),
             BotCommand("broadcast", "Barcha DM foydalanuvchilarga matn yuborish (owner)"),
             BotCommand("broadcastpost", "Barcha DM foydalanuvchilarga post-forward (owner)"),
+            BotCommand("broadcastgroup", "Bot admin bo‘lgan guruhlarga matn yuborish (owner)"),
+            BotCommand("broadcastpostgroup", "Bot admin bo‘lgan guruhlarga post-forward (owner)"),
         ],
         scope=BotCommandScopeAllPrivateChats()
     )
@@ -2681,6 +2778,10 @@ def main():
     # DM broadcast (owner only)
     app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(CommandHandler("broadcastpost", broadcastpost))
+
+    # GROUP broadcast (owner only)
+    app.add_handler(CommandHandler("broadcastgroup", broadcastgroup))
+    app.add_handler(CommandHandler("broadcastpostgroup", broadcastpostgroup))
 
     # Callbacks
     app.add_handler(CallbackQueryHandler(on_set_limit, pattern=r"^set_limit:"))
