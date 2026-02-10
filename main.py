@@ -115,7 +115,24 @@ log = logging.getLogger(__name__)
 TOKEN = os.getenv("TOKEN")
 if not TOKEN:
     raise RuntimeError("TOKEN env o'rnatilmagan. Railway Variables ga TOKEN=... qo'ying.")
-WHITELIST = {165553982, "Yunus1995"}
+def _parse_admin_ids(raw: str) -> set[int]:
+    ids: set[int] = set()
+    for part in re.split(r"[,\s]+", (raw or "").strip()):
+        if not part:
+            continue
+        try:
+            ids.add(int(part))
+        except Exception:
+            pass
+    return ids
+
+# Bot egasi (broadcast) ID'lari: Railway Variables -> ADMIN_IDS=12345,67890
+OWNER_IDS = _parse_admin_ids(os.getenv("ADMIN_IDS", ""))
+if not OWNER_IDS:
+    log.warning("ADMIN_IDS env bo‘sh. Railway Variables ga ADMIN_IDS=12345678 (yoki vergul bilan bir nechta) qo‘ying.")
+
+# Filterlarda teginilmaydiganlar (owner ID'lari ham avtomatik kiradi)
+WHITELIST = set(OWNER_IDS) | {"0"}
 TUN_REJIMI = False
 KANAL_USERNAME = None
 
@@ -535,8 +552,7 @@ SUSPECT_DOMAINS = {"cattea", "gamee", "hamster", "notcoin", "tgme", "t.me/gamee"
 # ----------- DM (Postgres-backed) -----------
 SUB_USERS_FILE = "subs_users.json"  # fallback/migration manbasi
 
-OWNER_IDS = {165553982}
-
+# OWNER_IDS yuqorida ADMIN_IDS env orqali yuklanadi.
 def is_owner(update: Update) -> bool:
     u = update.effective_user
     return bool(u and u.id in OWNER_IDS)
@@ -858,7 +874,8 @@ async def help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📘<b>ЁРДАМЧИ БУЙРУҚЛАР</b>\n"
         "🔹 <b>/tun</b> — Тун режими(шу дақиқадан гурухга ёзилган хабарлар автоматик ўчирилиб турилади).\n"
         "🔹 <b>/tunoff</b> — Тун режимини ўчириш.\n"
-        "🔹 <b>/ruxsat</b> — (Ответит) орқали имтиёз бериш.\n\n"
+        "🔹 <b>/ruxsat</b> — (Ответит) орқали имтиёз бериш.\n"
+        "🔹 <b>/ruxsatoff</b> — (Ответит) орқали имтиёзни олиб қўйиш.\n\n"
         "👥<b>ГУРУХГА МАЖБУР ОДАМ ҚЎШТИРИШ ВА КАНАЛГА МАЖБУР АЪЗО БЎЛДИРИШ</b>\n"
         "🔹 <b>/kanal @kanal1 @kanal2</b> — Мажбурий кўрсатилган каналга аъзо қилдириш.\n"
         "🔹 <b>/kanaloff</b> — Мажбурий каналга аъзони ўчириш.\n"
@@ -1625,6 +1642,25 @@ async def grant_priv_db(chat_id: int, user_id: int):
     except Exception as e:
         log.warning(f"grant_priv_db xatolik: {e}")
 
+async def revoke_priv_db(chat_id: int, user_id: int):
+    # Cache'dan o'chiramiz
+    try:
+        if chat_id in _GROUP_PRIV_MEM:
+            _GROUP_PRIV_MEM[chat_id].discard(user_id)
+    except Exception:
+        pass
+
+    if not DB_POOL:
+        return
+    try:
+        async with DB_POOL.acquire() as con:
+            await con.execute(
+                "DELETE FROM group_privileges WHERE chat_id=$1 AND user_id=$2;",
+                chat_id, user_id
+            )
+    except Exception as e:
+        log.warning(f"revoke_priv_db xatolik: {e}")
+
 async def clear_privs_db(chat_id: int):
     if not DB_POOL:
         return
@@ -1979,6 +2015,38 @@ async def ruxsat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ {label} foydalanuvchiga ruxsat berildi (shu guruhda).",
         parse_mode="HTML"
     )
+
+async def ruxsatoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update):
+        return await update.effective_message.reply_text("⛔ Faqat adminlar.")
+    if not update.effective_message.reply_to_message:
+        return await update.effective_message.reply_text("Iltimos, foydalanuvchi xabariga reply qiling.")
+    chat_id = update.effective_chat.id
+    target_user = update.effective_message.reply_to_message.from_user
+    uid = target_user.id
+
+    await revoke_priv_db(chat_id, uid)
+
+    # Avvalgi blok/cooldown bo'lsa — tozalaymiz (oddiy holatga qaytsin)
+    try:
+        await clear_block_db(chat_id, uid)
+    except Exception:
+        pass
+    try:
+        await context.bot.restrict_chat_member(
+            chat_id=chat_id,
+            user_id=uid,
+            permissions=FULL_PERMS,
+        )
+    except Exception:
+        pass
+
+    label = html.escape(_user_label_from_user(target_user))
+    await update.effective_message.reply_text(
+        f"🚫 {label} foydalanuvchidan ruxsat olib qo‘yildi (shu guruhda).",
+        parse_mode="HTML"
+    )
+
 
 # --------- Override stats commands to be per-group ----------
 def _user_label_from_user(u) -> str:
@@ -2565,6 +2633,7 @@ async def set_commands(app):
             BotCommand("cleangroup", "Hamma hisobini 0 qilish"),
             BotCommand("cleanuser", "(reply) foydalanuvchi hisobini 0 qilish"),
             BotCommand("ruxsat", "(reply) imtiyoz berish"),
+            BotCommand("ruxsatoff", "(reply) imtiyozni olib qo‘yish"),
             BotCommand("kanal", "Majburiy kanalni sozlash"),
             BotCommand("kanaloff", "Majburiy kanalni o‘chirish"),
             BotCommand("tun", "Tun rejimini yoqish"),
@@ -2598,6 +2667,7 @@ def main():
     app.add_handler(CommandHandler("tun", tun))
     app.add_handler(CommandHandler("tunoff", tunoff))
     app.add_handler(CommandHandler("ruxsat", ruxsat))
+    app.add_handler(CommandHandler("ruxsatoff", ruxsatoff))
     app.add_handler(CommandHandler("kanal", kanal))
     app.add_handler(CommandHandler("kanaloff", kanaloff))
     app.add_handler(CommandHandler("majbur", majbur))
